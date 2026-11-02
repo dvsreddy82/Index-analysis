@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local config / secrets (e.g. MONGO_URI with credentials)
+.env
+.env.*
+
+# App runtime output (default lives in ~/.nse_analytics, but in case NSE_APP_HOME points here)
+.nse_analytics/
+chart/
+*.log
+
+# Data exports / back-fill files
+*.csv
+
+# MongoDB local data if run from the project folder
+data/db/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
