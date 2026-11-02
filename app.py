@@ -735,6 +735,7 @@ class MainWindow(QMainWindow):
         errs = summary.get("errors") or []
         cash = summary.get("fii_cash") or {}
         msg = (f"Synced · OI days +{summary.get('participant_oi_days', 0)}"
+               f" · cash days {summary.get('fii_cash_days', 0)}"
                + (f" · FII {cash.get('fii_cash_net', 0):+,.0f} / DII {cash.get('dii_cash_net', 0):+,.0f} cr "
                   f"({pd.Timestamp(cash['date']):%d-%b})" if cash else ""))
         if errs:

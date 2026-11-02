@@ -97,7 +97,7 @@ plus the ETFs that track them.
 |---|---|
 | `config.py` | All tunables (Mongo URI, symbols, thresholds); each can be overridden by an environment variable |
 | `db_handler.py` | MongoDB connection, JSON-schema validators, compound/unique indexes, idempotent bulk upserts |
-| `data_fetcher.py` | yfinance OHLCV + macro, NSE FII/DII cash, participant-wise OI parser, CSV back-fill, `DataService` facade |
+| `data_fetcher.py` | yfinance OHLCV + macro, NSE FII/DII cash, Moneycontrol 30-session cash history, participant-wise OI parser, CSV back-fill, `DataService` facade |
 | `indicators.py` | Full quant engine; `python indicators.py NIFTYBEES.NS 1D` prints the analysis as JSON |
 | `app.py` | Desktop GUI: live tab, chart tab, scanner tab, decision panels |
 | `live_view.py` | Live one-screen dashboard (tiles, range bars, auto-refresh) |
@@ -151,7 +151,7 @@ pip install -r requirements.txt
 ```bash
 python data_fetcher.py
 ```
-This is the initial sync. It fetches about 2 years of daily bars (from the NSE archive for the 33 archive indices, from Yahoo for NIFTY 50 and the ETFs), 180 days of 1H bars and 60 days of 15m bars for all 56 instruments, the latest FII/DII cash figures, about 90 days of participant OI, and the macro series. It takes about 1–2 minutes.
+This is the initial sync. It fetches about 2 years of daily bars (from the NSE archive for the 33 archive indices, from Yahoo for NIFTY 50 and the ETFs), 180 days of 1H bars and 60 days of 15m bars for all 56 instruments, the last ~30 sessions of FII/DII cash figures, about 90 days of participant OI, and the macro series. It takes about 1–2 minutes.
 ```bash
 python app.py
 ```
@@ -168,7 +168,7 @@ python indicators.py ^NSEI 1D
 Prints the full analysis as JSON (no GUI).
 
 ### Data notes
-* **FII/DII cash history:** NSE's API only returns the **latest** session, so the cash history builds up in MongoDB with each daily sync. To back-fill, use the **Import FII/DII history (CSV)…** button. Any CSV with a date column and columns containing `FII…Net` and `DII…Net` works (for example a Moneycontrol or NSDL export).
+* **FII/DII cash history:** NSE's API only returns the **latest** session, so every sync also reads the last ~30 sessions from Moneycontrol's FII/DII cash page, which carries the same NSE provisional figures. Older days then build up in MongoDB with each sync. Skip a sync for more than ~6 weeks and you get a gap. To back-fill further, use the **Import FII/DII history (CSV)…** button. Any CSV with a date column and columns containing `FII…Net` and `DII…Net` works (for example a Moneycontrol or NSDL export).
 * **Participant OI** (FII index-futures long/short, client long/short, index PCR) comes from NSE's daily archive CSVs, so this history is back-filled automatically.
 * If MongoDB is unreachable, the app still runs on an in-memory store (shown in red in the sidebar), but nothing is saved between runs.
 * Event dates in the catalyst module are partly approximate (RBI MPC uses typical windows). The FOMC dates are listed in `indicators._FOMC`, so extend that list each year.

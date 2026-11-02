@@ -4,19 +4,23 @@ Sources
 -------
 * OHLCV (1D / 1H / 15m) for ^NSEI and NIFTYBEES.NS ............ yfinance
 * FII / DII provisional cash-market net (latest session) ...... nseindia.com/api/fiidiiTradeReact
+* FII / DII cash-market history (last ~30 sessions) ............ moneycontrol.com/markets/fii-dii-data/cash
 * Participant-wise open interest (daily archive CSV) ........... nsearchives.nseindia.com
       -> FII index-futures long/short ratio, client long/short ratio,
          index-options put/call OI ratio (PCR)
 * Macro catalysts (Brent, USD/INR, US10Y, India VIX, DXY) ..... yfinance
 
-NSE serves the cash FII/DII figure only for the latest session, so history
-accumulates in MongoDB with every daily sync.  To back-fill, use
-`import_fii_dii_csv()` with any export that has date / FII net / DII net columns.
+NSE serves the cash FII/DII figure only for the latest session, so every sync
+also pulls the ~30-session table Moneycontrol publishes (same NSE provisional
+figures) and history accumulates in MongoDB from there.  For a deeper back-fill
+use `import_fii_dii_csv()` with any export that has date / FII net / DII net columns.
 """
 from __future__ import annotations
 
 import io
+import json
 import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
@@ -283,6 +287,39 @@ def parse_participant_oi(text: str, day: date) -> dict:
     }
 
 
+MONEYCONTROL_CASH_URL = "https://www.moneycontrol.com/markets/fii-dii-data/cash/"
+
+
+def fetch_fii_dii_cash_history(timeout: int = 20) -> list[dict]:
+    """FII/FPI and DII cash-market buy/sell/net (₹ crore) for the last ~30
+    sessions, read from the JSON Moneycontrol embeds in its FII/DII page."""
+    r = requests.get(MONEYCONTROL_CASH_URL, headers={"User-Agent": NSEClient.HEADERS["User-Agent"]},
+                     timeout=timeout)
+    r.raise_for_status()
+    return parse_moneycontrol_cash(r.text)
+
+
+def parse_moneycontrol_cash(html: str) -> list[dict]:
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+    if not m:
+        raise ValueError("Moneycontrol page has no __NEXT_DATA__ block")
+    rows = json.loads(m.group(1))["props"]["pageProps"]["FiiDiiData"]["fiiDiiData"]
+    out = []
+    for row in rows:
+        d = pd.to_datetime(row.get("date"), errors="coerce")
+        net = _num(row.get("fiiNet"))
+        if pd.isna(d) or net is None:
+            continue
+        out.append({"date": d.normalize(),
+                    "fii_cash_buy": _num(row.get("fiiPurchase")),
+                    "fii_cash_sell": _num(row.get("fiiSales")),
+                    "fii_cash_net": net,
+                    "dii_cash_buy": _num(row.get("diiPurchase")),
+                    "dii_cash_sell": _num(row.get("diiSale") or row.get("diiSales")),
+                    "dii_cash_net": _num(row.get("diiNet"))})
+    return out
+
+
 def import_fii_dii_csv(path: str) -> list[dict]:
     """Back-fill helper. Accepts any CSV with a date column plus columns whose
     names contain 'fii'/'fpi' and 'dii' and 'net' (e.g. Moneycontrol/NSDL exports)."""
@@ -405,7 +442,7 @@ class DataService:
         say = progress or (lambda m: log.info(m))
         symbols = symbols or list(config.SYMBOLS)
         timeframes = timeframes or list(config.TIMEFRAMES)
-        summary: dict = {"ohlcv": {}, "fii_cash": None, "participant_oi_days": 0, "macro": 0,
+        summary: dict = {"ohlcv": {}, "fii_cash": None, "fii_cash_days": 0, "participant_oi_days": 0, "macro": 0,
                          "index_archive_days": 0, "errors": []}
 
         if any(_daily_from_nse(s) for s in symbols) and "1D" in timeframes:
@@ -430,13 +467,22 @@ class DataService:
                     summary["errors"].append(f"{sym} {tf}: {exc}")
                     log.exception("OHLCV sync failed")
 
+        say("Fetching FII/DII cash history (Moneycontrol, ~30 sessions) …")
+        try:
+            hist = fetch_fii_dii_cash_history()
+            self.store.upsert_fii_dii(hist)
+            summary["fii_cash_days"] = len(hist)
+        except Exception as exc:
+            summary["errors"].append(f"FII/DII cash history: {exc}")
+            log.warning("Moneycontrol FII/DII history failed: %s", exc)
+
         say("Fetching FII/DII cash provisional data from NSE …")
         try:
-            cash = self.nse.fii_dii_cash()
+            cash = self.nse.fii_dii_cash()   # latest session; may be newer than the history table
             if cash:
                 self.store.upsert_fii_dii([cash])
                 summary["fii_cash"] = cash
-            else:
+            elif not summary.get("fii_cash_days"):
                 summary["errors"].append("NSE FII/DII cash endpoint unavailable")
         except Exception as exc:
             summary["errors"].append(f"FII/DII cash: {exc}")
