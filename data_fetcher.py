@@ -4,15 +4,16 @@ Sources
 -------
 * OHLCV (1D / 1H / 15m) for ^NSEI and NIFTYBEES.NS ............ yfinance
 * FII / DII provisional cash-market net (latest session) ...... nseindia.com/api/fiidiiTradeReact
-* FII / DII cash-market history (last ~30 sessions) ............ moneycontrol.com/markets/fii-dii-data/cash
+* FII / DII cash-market history (net, last ~90 sessions) ....... niftytrader.in/fii-dii-data
+      + buy/sell/net for the last ~30 sessions ................. moneycontrol.com/markets/fii-dii-data/cash
 * Participant-wise open interest (daily archive CSV) ........... nsearchives.nseindia.com
       -> FII index-futures long/short ratio, client long/short ratio,
          index-options put/call OI ratio (PCR)
 * Macro catalysts (Brent, USD/INR, US10Y, India VIX, DXY) ..... yfinance
 
 NSE serves the cash FII/DII figure only for the latest session, so every sync
-also pulls the ~30-session table Moneycontrol publishes (same NSE provisional
-figures) and history accumulates in MongoDB from there.  For a deeper back-fill
+also pulls the ~90-session history NiftyTrader and Moneycontrol publish (same
+NSE provisional figures) and history accumulates in MongoDB from there.  For a deeper back-fill
 use `import_fii_dii_csv()` with any export that has date / FII net / DII net columns.
 """
 from __future__ import annotations
@@ -288,22 +289,51 @@ def parse_participant_oi(text: str, day: date) -> dict:
 
 
 MONEYCONTROL_CASH_URL = "https://www.moneycontrol.com/markets/fii-dii-data/cash/"
+NIFTYTRADER_CASH_URL = "https://www.niftytrader.in/fii-dii-data"
 
 
 def fetch_fii_dii_cash_history(timeout: int = 20) -> list[dict]:
-    """FII/FPI and DII cash-market buy/sell/net (₹ crore) for the last ~30
-    sessions, read from the JSON Moneycontrol embeds in its FII/DII page."""
-    r = requests.get(MONEYCONTROL_CASH_URL, headers={"User-Agent": NSEClient.HEADERS["User-Agent"]},
-                     timeout=timeout)
-    r.raise_for_status()
-    return parse_moneycontrol_cash(r.text)
+    """FII/FPI and DII cash-market figures (₹ crore), merged from two pages that
+    republish NSE's provisional numbers: NiftyTrader (net only, ~90 sessions)
+    and Moneycontrol (buy/sell/net, ~30 sessions). Either may fail on its own."""
+    by_date: dict = {}
+    errors = []
+    for url, parse in ((NIFTYTRADER_CASH_URL, parse_niftytrader_cash),
+                       (MONEYCONTROL_CASH_URL, parse_moneycontrol_cash)):
+        try:
+            r = requests.get(url, headers={"User-Agent": NSEClient.HEADERS["User-Agent"]}, timeout=timeout)
+            r.raise_for_status()
+            for rec in parse(r.text):
+                by_date.setdefault(rec["date"], {}).update({k: v for k, v in rec.items() if v is not None})
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+            log.warning("FII/DII cash history from %s failed: %s", url, exc)
+    if not by_date and errors:
+        raise RuntimeError("; ".join(errors))
+    return [by_date[d] for d in sorted(by_date)]
+
+
+def _next_data(html: str) -> dict:
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+    if not m:
+        raise ValueError("page has no __NEXT_DATA__ block")
+    return json.loads(m.group(1))["props"]["pageProps"]
+
+
+def parse_niftytrader_cash(html: str) -> list[dict]:
+    out = []
+    for row in _next_data(html)["series"]:
+        d = pd.to_datetime(row.get("created_at"), errors="coerce")
+        net = _num(row.get("fii_net_value"))
+        if pd.isna(d) or net is None:
+            continue
+        out.append({"date": d.normalize(), "fii_cash_net": net,
+                    "dii_cash_net": _num(row.get("dii_net_value"))})
+    return out
 
 
 def parse_moneycontrol_cash(html: str) -> list[dict]:
-    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
-    if not m:
-        raise ValueError("Moneycontrol page has no __NEXT_DATA__ block")
-    rows = json.loads(m.group(1))["props"]["pageProps"]["FiiDiiData"]["fiiDiiData"]
+    rows = _next_data(html)["FiiDiiData"]["fiiDiiData"]
     out = []
     for row in rows:
         d = pd.to_datetime(row.get("date"), errors="coerce")
@@ -437,7 +467,7 @@ class DataService:
         self.live_nse = NSEClient(timeout=8, retries=2)
 
     # ---------------------------------------------------------- sync
-    def sync(self, symbols=None, timeframes=None, oi_backfill_days: int = 90,
+    def sync(self, symbols=None, timeframes=None, oi_backfill_days: int = 135,   # ~90 sessions, matching the cash history
              progress: Progress | None = None) -> dict:
         say = progress or (lambda m: log.info(m))
         symbols = symbols or list(config.SYMBOLS)
@@ -467,14 +497,14 @@ class DataService:
                     summary["errors"].append(f"{sym} {tf}: {exc}")
                     log.exception("OHLCV sync failed")
 
-        say("Fetching FII/DII cash history (Moneycontrol, ~30 sessions) …")
+        say("Fetching FII/DII cash history (~90 sessions) …")
         try:
             hist = fetch_fii_dii_cash_history()
             self.store.upsert_fii_dii(hist)
             summary["fii_cash_days"] = len(hist)
         except Exception as exc:
             summary["errors"].append(f"FII/DII cash history: {exc}")
-            log.warning("Moneycontrol FII/DII history failed: %s", exc)
+            log.warning("FII/DII cash history failed: %s", exc)
 
         say("Fetching FII/DII cash provisional data from NSE …")
         try:
