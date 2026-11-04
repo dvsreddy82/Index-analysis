@@ -1,0 +1,777 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Realtime chart</title>
+<script src="../vendor/lightweight-charts.standalone.production.js"></script>
+<style>
+  :root { --bg:#0b0f17; --panel:#111827; --panel2:#0f172a; --border:#1f2937; --text:#e5e7eb; --muted:#94a3b8;
+          --accent:#38bdf8; --up:#22c55e; --down:#ef4444; --amber:#f59e0b; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text);
+               font:12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; overflow:hidden; user-select:none; }
+  #bar { display:flex; flex-wrap:wrap; gap:4px; align-items:center; padding:6px 8px; background:var(--panel);
+         border:1px solid var(--border); border-radius:8px; margin:0 0 6px 0; }
+  .grp { display:flex; gap:2px; align-items:center; padding-right:6px; margin-right:4px; border-right:1px solid var(--border); }
+  .grp:last-child { border-right:none; }
+  button, select { background:var(--panel2); color:var(--text); border:1px solid var(--border); border-radius:5px;
+                   padding:3px 8px; font:inherit; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button.on { background:#0c4a6e; border-color:var(--accent); color:#fff; }
+  .lbl { color:var(--muted); margin:0 4px 0 2px; }
+  #main { position:absolute; top:46px; left:0; right:0; bottom:0; display:flex; gap:6px; }
+  #main.stack { flex-direction:column; }
+  .cell { position:relative; flex:1 1 0; min-width:0; min-height:0; background:var(--panel2); border:1px solid var(--border);
+          border-radius:8px; overflow:hidden; display:flex; flex-direction:column; }
+  .cell.hidden { display:none; }
+  .head { padding:5px 10px 3px; border-bottom:1px solid var(--border); background:var(--panel); white-space:nowrap;
+          overflow:hidden; text-overflow:ellipsis; }
+  .head .nm { font-weight:800; font-size:14px; }
+  .head .px { font-weight:800; font-size:14px; margin-left:6px; }
+  .head .ch { font-weight:700; margin-left:6px; }
+  .head .meta { color:var(--muted); font-size:11px; margin-left:8px; }
+  .sub { color:var(--muted); font-size:11px; padding:2px 10px 3px; background:var(--panel); border-bottom:1px solid var(--border);
+         white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .chart { position:relative; flex:1; min-height:0; }
+  .legend { position:absolute; left:8px; top:6px; z-index:3; pointer-events:none; font-size:11px; line-height:16px;
+            text-shadow:0 0 3px #000; }
+  .legend b { font-weight:600; }
+  .legend .row { white-space:nowrap; }
+  .measure { position:absolute; z-index:4; pointer-events:none; border:1px dashed var(--accent);
+             background:rgba(56,189,248,.10); display:none; }
+  .measure .tag { position:absolute; left:50%; transform:translateX(-50%); bottom:100%; margin-bottom:3px; white-space:nowrap;
+                  background:#0c4a6e; color:#fff; padding:2px 6px; border-radius:4px; font-size:11px; }
+  .measure.dn { border-color:var(--down); background:rgba(239,68,68,.10); }
+  .measure.dn .tag { background:#7f1d1d; }
+  .pop { position:absolute; z-index:20; background:var(--panel); border:1px solid var(--border); border-radius:8px;
+         padding:8px 10px; box-shadow:0 8px 24px rgba(0,0,0,.5); display:none; min-width:250px; }
+  .pop .r { display:flex; align-items:center; gap:6px; margin:3px 0; }
+  .pop input[type=number] { width:56px; background:var(--panel2); color:var(--text); border:1px solid var(--border);
+                            border-radius:4px; padding:2px 4px; font:inherit; }
+  .pop h4 { margin:2px 0 6px; font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+  .pop .al { display:flex; justify-content:space-between; gap:8px; padding:3px 0; border-bottom:1px solid var(--border); }
+  .pop .x { cursor:pointer; color:var(--down); padding:0 4px; }
+  #toast { position:absolute; right:12px; top:52px; z-index:30; display:flex; flex-direction:column; gap:6px; }
+  #toast div { background:#7c2d12; border:1px solid var(--amber); color:#fff; padding:8px 12px; border-radius:6px;
+               box-shadow:0 6px 20px rgba(0,0,0,.5); font-weight:600; }
+  #mode { color:var(--amber); font-weight:600; margin-left:6px; }
+  .empty { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; color:var(--muted); z-index:2; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <div class="grp" id="tfs"><span class="lbl">TF</span></div>
+  <div class="grp"><span class="lbl">Show</span>
+    <select id="days"><option value="1">1 day</option><option value="2">2 days</option><option value="5">5 days</option>
+      <option value="0">All loaded</option></select></div>
+  <div class="grp"><span class="lbl">Type</span>
+    <select id="ctype"><option value="candles">Candles</option><option value="ha">Heikin Ashi</option>
+      <option value="bars">OHLC bars</option><option value="line">Line</option><option value="area">Area</option></select></div>
+  <div class="grp"><button id="btnInd">Indicators ▾</button><button id="btnLv">Levels ▾</button></div>
+  <div class="grp"><span class="lbl">Draw</span>
+    <button data-mode="h" title="Horizontal line (H)">― H-line</button>
+    <button data-mode="t" title="Trend line: two clicks (T)">╱ Trend</button>
+    <button data-mode="m" title="Measure: two clicks (M)">⇕ Measure</button>
+    <button data-mode="a" title="Price alert at click (A)">⏰ Alert</button>
+    <button id="undo" title="Undo last drawing (Ctrl+Z)">↶</button>
+    <button id="clear" title="Clear drawings on both charts">Clear</button>
+    <button id="btnAl">Alerts (0) ▾</button></div>
+  <div class="grp"><span class="lbl">Layout</span>
+    <select id="layout"><option value="both">Side by side</option><option value="stack">Stacked</option>
+      <option value="^NSEI">NIFTY only</option><option value="NIFTY BANK">BANKNIFTY only</option></select>
+    <button id="sync" title="Sync crosshair and scrolling between the two charts">Sync</button>
+    <button id="cmp" title="Overlay the other index's % change (single layout)">Compare</button>
+    <button id="fit" title="Fit all loaded data">Fit</button>
+    <button id="live" title="Scroll to the latest candle">⇥ Latest</button>
+    <button id="shot" title="Save a PNG of the chart">📷</button></div>
+  <span id="mode"></span>
+</div>
+<div id="main"></div>
+<div id="toast"></div>
+
+<div class="pop" id="popInd">
+  <h4>Overlays</h4>
+  <div class="r"><input type="checkbox" id="i_ema1"> EMA <input type="number" id="i_ema1_n" min="2" max="400"></div>
+  <div class="r"><input type="checkbox" id="i_ema2"> EMA <input type="number" id="i_ema2_n" min="2" max="400"></div>
+  <div class="r"><input type="checkbox" id="i_sma"> SMA <input type="number" id="i_sma_n" min="2" max="400"></div>
+  <div class="r"><input type="checkbox" id="i_bb"> Bollinger <input type="number" id="i_bb_n" min="5" max="200">
+    × <input type="number" id="i_bb_k" min="0.5" max="5" step="0.5"></div>
+  <div class="r"><input type="checkbox" id="i_st"> Supertrend <input type="number" id="i_st_n" min="3" max="100">
+    × <input type="number" id="i_st_k" min="0.5" max="10" step="0.5"></div>
+  <div class="r"><input type="checkbox" id="i_vw"> Session VWAP (equal-weight, index has no volume)</div>
+  <h4>Panes</h4>
+  <div class="r"><input type="checkbox" id="i_rsi"> RSI <input type="number" id="i_rsi_n" min="2" max="100"></div>
+  <div class="r"><input type="checkbox" id="i_macd"> MACD 12 / 26 / 9</div>
+  <div class="r"><input type="checkbox" id="i_atr"> ATR <input type="number" id="i_atr_n" min="2" max="100"></div>
+</div>
+<div class="pop" id="popLv">
+  <h4>Price levels</h4>
+  <div class="r"><input type="checkbox" id="l_pd"> Previous day high / low / close</div>
+  <div class="r"><input type="checkbox" id="l_cpr"> CPR (pivot, BC, TC)</div>
+  <div class="r"><input type="checkbox" id="l_piv"> Classic pivots R1–R3 / S1–S3</div>
+  <div class="r"><input type="checkbox" id="l_cam"> Camarilla H3/H4 / L3/L4</div>
+  <div class="r"><input type="checkbox" id="l_pw"> Previous week high / low</div>
+  <div class="r"><input type="checkbox" id="l_dhl"> Today's high / low</div>
+  <div class="r"><input type="checkbox" id="l_orb"> Opening range <select id="l_orb_n"><option>5</option><option>15</option><option>30</option></select> min</div>
+  <h4>From the app</h4>
+  <div class="r"><input type="checkbox" id="l_sr"> Daily support / resistance zones</div>
+  <div class="r"><input type="checkbox" id="l_opt"> Option OI walls + max pain</div>
+  <div class="r"><input type="checkbox" id="l_pos"> My open option strikes</div>
+</div>
+<div class="pop" id="popAl"><h4>Price alerts</h4><div id="alList"></div>
+  <div class="r" style="margin-top:6px"><select id="alSym"></select><input type="number" id="alPx" style="width:90px" placeholder="price">
+    <button id="alAdd">Add</button></div>
+  <div style="color:var(--muted);font-size:10px;margin-top:4px">An alert fires once when the live price crosses it, then switches off.</div>
+</div>
+
+<script>
+"use strict";
+const LW = LightweightCharts;
+const SYMS = [{id: "^NSEI", name: "NIFTY 50", und: "NIFTY"}, {id: "NIFTY BANK", name: "BANKNIFTY", und: "BANKNIFTY"}];
+const TFS = [["1", 1], ["3", 3], ["5", 5], ["10", 10], ["15", 15], ["30", 30], ["1H", 60], ["1D", 1440]];
+const COL = {up: "#22c55e", down: "#ef4444", text: "#e5e7eb", muted: "#94a3b8", grid: "#1a2332", border: "#1f2937",
+             ema1: "#f59e0b", ema2: "#a78bfa", sma: "#38bdf8", bb: "#64748b", vw: "#e879f9", st_up: "#22c55e",
+             st_dn: "#ef4444", rsi: "#a78bfa", macd: "#38bdf8", sig: "#f59e0b", atr: "#2dd4bf"};
+const SESSION_OPEN = 9 * 60 + 15, SESSION_CLOSE = 15 * 60 + 30;
+const DEFAULT = {
+  tf: 5, days: 2, type: "candles", layout: "both", sync: true, cmp: false,
+  ind: {ema1: {on: true, n: 9}, ema2: {on: true, n: 21}, sma: {on: false, n: 50}, bb: {on: false, n: 20, k: 2},
+        st: {on: false, n: 10, k: 3}, vw: {on: false}, rsi: {on: true, n: 14}, macd: {on: false}, atr: {on: false, n: 14}},
+  lv: {pd: true, cpr: true, piv: false, cam: false, pw: false, dhl: false, orb: true, orb_n: 15, sr: true, opt: true, pos: true},
+  drawings: {}, alerts: [],
+};
+let S = JSON.parse(JSON.stringify(DEFAULT));
+const DATA = {};      // sym -> {m1: [[t,o,h,l,c]], d1: [[t,o,h,l,c]], ctx: {}}
+const VIEWS = {};
+let MODE = null, PENDING = null, SRC = {text: "", live: false};
+
+const py = (type, payload) => console.log("PY:" + JSON.stringify(Object.assign({type}, payload || {})));
+const fmt = (v, d = 2) => v == null || isNaN(v) ? "—" : Number(v).toLocaleString("en-IN", {minimumFractionDigits: d, maximumFractionDigits: d});
+const sgn = (v, d = 2) => (v >= 0 ? "+" : "") + fmt(v, d);
+const clr = v => v >= 0 ? COL.up : COL.down;
+const save = () => py("save", {state: S});
+
+// ------------------------------------------------------------------ data helpers
+// times are IST wall-clock encoded as UTC seconds, so the axis shows IST
+const dayOf = t => Math.floor(t / 86400) * 86400;
+const minOfDay = t => Math.floor((t % 86400) / 60);
+function bucket(t, tf) {
+  if (tf >= 1440) return dayOf(t);
+  const m = minOfDay(t) - SESSION_OPEN;
+  return dayOf(t) + (SESSION_OPEN + Math.floor(m / tf) * tf) * 60;
+}
+function resample(m1, tf) {
+  if (tf === 1) return m1.map(b => ({time: b[0], open: b[1], high: b[2], low: b[3], close: b[4]}));
+  const out = [];
+  let cur = null;
+  for (const b of m1) {
+    const k = bucket(b[0], tf);
+    if (!cur || cur.time !== k) { cur = {time: k, open: b[1], high: b[2], low: b[3], close: b[4]}; out.push(cur); }
+    else { cur.high = Math.max(cur.high, b[2]); cur.low = Math.min(cur.low, b[3]); cur.close = b[4]; }
+  }
+  return out;
+}
+function dailyBars(sym) {
+  const d = DATA[sym], out = (d.d1 || []).map(b => ({time: dayOf(b[0]), open: b[1], high: b[2], low: b[3], close: b[4]}));
+  const today = sessions(d.m1).slice(-1)[0];
+  if (today && today.length) {
+    const t = dayOf(today[0][0]);
+    const bar = {time: t, open: today[0][1], high: Math.max(...today.map(b => b[2])), low: Math.min(...today.map(b => b[3])),
+                 close: today[today.length - 1][4]};
+    while (out.length && out[out.length - 1].time > t) out.pop();
+    if (out.length && out[out.length - 1].time === t) out[out.length - 1] = bar; else out.push(bar);
+  }
+  return out;
+}
+function sessions(m1) {
+  const out = [];
+  let day = null;
+  for (const b of m1 || []) {
+    const d = dayOf(b[0]);
+    if (d !== day) { out.push([]); day = d; }
+    out[out.length - 1].push(b);
+  }
+  return out;
+}
+const hlc = s => s && s.length ? {o: s[0][1], h: Math.max(...s.map(b => b[2])), l: Math.min(...s.map(b => b[3])), c: s[s.length - 1][4]} : null;
+function heikin(bars) {
+  const out = [];
+  bars.forEach((b, i) => {
+    const c = (b.open + b.high + b.low + b.close) / 4;
+    const o = i ? (out[i - 1].open + out[i - 1].close) / 2 : (b.open + b.close) / 2;
+    out.push({time: b.time, open: o, close: c, high: Math.max(b.high, o, c), low: Math.min(b.low, o, c)});
+  });
+  return out;
+}
+
+// ------------------------------------------------------------------ indicators
+function ema(v, n) { const k = 2 / (n + 1), o = []; let e = null;
+  v.forEach((x, i) => { e = e == null ? x : x * k + e * (1 - k); o.push(i >= n - 1 ? e : null); }); return o; }
+function sma(v, n) { const o = []; let s = 0;
+  v.forEach((x, i) => { s += x; if (i >= n) s -= v[i - n]; o.push(i >= n - 1 ? s / n : null); }); return o; }
+function stdev(v, n, m) { return v.map((_, i) => { if (m[i] == null) return null; let s = 0;
+  for (let j = i - n + 1; j <= i; j++) s += (v[j] - m[i]) ** 2; return Math.sqrt(s / n); }); }
+function rma(v, n) { const o = []; let r = null;
+  v.forEach((x, i) => { if (i < n - 1) { o.push(null); return; }
+    r = r == null ? v.slice(0, n).reduce((a, b) => a + b, 0) / n : (r * (n - 1) + x) / n; o.push(r); }); return o; }
+function trueRange(b) { return b.map((x, i) => i ? Math.max(x.high - x.low, Math.abs(x.high - b[i - 1].close), Math.abs(x.low - b[i - 1].close)) : x.high - x.low); }
+function rsi(c, n) {
+  const g = [0], l = [0];
+  for (let i = 1; i < c.length; i++) { const d = c[i] - c[i - 1]; g.push(Math.max(d, 0)); l.push(Math.max(-d, 0)); }
+  const ag = rma(g, n), al = rma(l, n);
+  return ag.map((x, i) => x == null ? null : al[i] === 0 ? 100 : 100 - 100 / (1 + x / al[i]));
+}
+function supertrend(b, n, k) {
+  const atr = rma(trueRange(b), n), out = [];
+  let fu = null, fl = null, dir = 1;
+  b.forEach((x, i) => {
+    if (atr[i] == null) { out.push(null); return; }
+    const mid = (x.high + x.low) / 2, bu = mid + k * atr[i], bl = mid - k * atr[i], pc = i ? b[i - 1].close : x.close;
+    fu = fu == null || bu < fu || pc > fu ? bu : fu;
+    fl = fl == null || bl > fl || pc < fl ? bl : fl;
+    if (dir === 1 && x.close < fl) dir = -1; else if (dir === -1 && x.close > fu) dir = 1;
+    out.push({v: dir === 1 ? fl : fu, dir});
+  });
+  return out;
+}
+function sessionVwap(b) {   // equal-weighted typical price, reset each session (indices carry no volume)
+  let day = null, s = 0, n = 0;
+  return b.map(x => { const d = dayOf(x.time); if (d !== day) { day = d; s = 0; n = 0; }
+    s += (x.high + x.low + x.close) / 3; n += 1; return s / n; });
+}
+
+// ------------------------------------------------------------------ chart view
+class View {
+  constructor(sym, name, und) {
+    this.sym = sym; this.name = name; this.und = und;
+    this.cell = document.createElement("div"); this.cell.className = "cell";
+    this.cell.innerHTML = `<div class="head"><span class="nm">${name}</span><span class="px">—</span><span class="ch"></span>
+      <span class="meta"></span></div><div class="sub"></div><div class="chart"><div class="legend"></div>
+      <div class="measure"><div class="tag"></div></div><div class="empty">Loading…</div></div>`;
+    document.getElementById("main").appendChild(this.cell);
+    this.el = this.cell.querySelector(".chart");
+    this.legend = this.cell.querySelector(".legend");
+    this.measureEl = this.cell.querySelector(".measure");
+    this.lines = []; this.drawSeries = []; this.ind = {}; this.bars = []; this.lastPx = null;
+    this.build();
+  }
+  build() {
+    const keep = this.chart && this.builtTf === S.tf ? this.chart.timeScale().getVisibleLogicalRange() : null;
+    const fresh = this.builtTf !== S.tf;
+    this.builtTf = S.tf;
+    if (this.chart) this.chart.remove();
+    this.el.querySelectorAll(".tv-lightweight-charts").forEach(n => n.remove());
+    const priceFormatter = p => fmt(p, Math.abs(p) >= 1000 ? 1 : 2);
+    this.chart = LW.createChart(this.el, {
+      autoSize: true,
+      layout: {background: {type: "solid", color: "#0f172a"}, textColor: COL.muted, fontSize: 11,
+               panes: {separatorColor: COL.border, separatorHoverColor: "#334155", enableResize: true}},
+      grid: {vertLines: {color: COL.grid}, horzLines: {color: COL.grid}},
+      crosshair: {mode: LW.CrosshairMode.Normal},
+      rightPriceScale: {borderColor: COL.border, scaleMargins: {top: 0.08, bottom: 0.08}},
+      leftPriceScale: {visible: false, borderColor: COL.border},
+      timeScale: {borderColor: COL.border, timeVisible: S.tf < 1440, secondsVisible: false, rightOffset: 6, barSpacing: 7},
+      localization: {priceFormatter, timeFormatter: t => {
+        const d = new Date(t * 1000); return d.toUTCString().slice(5, S.tf < 1440 ? 22 : 16); }},
+    });
+    const t = S.type;
+    const def = t === "bars" ? LW.BarSeries : t === "line" ? LW.LineSeries : t === "area" ? LW.AreaSeries : LW.CandlestickSeries;
+    const opts = t === "line" ? {color: COL.sma, lineWidth: 2}
+      : t === "area" ? {lineColor: COL.sma, topColor: "rgba(56,189,248,.35)", bottomColor: "rgba(56,189,248,0)", lineWidth: 2}
+      : t === "bars" ? {upColor: COL.up, downColor: COL.down, thinBars: false}
+      : {upColor: COL.up, downColor: COL.down, borderVisible: false, wickUpColor: COL.up, wickDownColor: COL.down};
+    this.main = this.chart.addSeries(def, opts, 0);
+    const line = (color, width = 1, pane = 0, extra = {}) => this.chart.addSeries(LW.LineSeries, Object.assign({
+      color, lineWidth: width, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false}, extra), pane);
+    const I = S.ind; this.ind = {};
+    if (I.ema1.on) this.ind.ema1 = line(COL.ema1, 1.5);
+    if (I.ema2.on) this.ind.ema2 = line(COL.ema2, 1.5);
+    if (I.sma.on) this.ind.sma = line(COL.sma, 1.5);
+    if (I.bb.on) { this.ind.bbU = line(COL.bb); this.ind.bbM = line(COL.bb, 1, 0, {lineStyle: LW.LineStyle.Dotted});
+                   this.ind.bbL = line(COL.bb); }
+    if (I.st.on) this.ind.st = line(COL.st_up, 2);
+    if (I.vw.on) this.ind.vw = line(COL.vw, 1.5, 0, {lineStyle: LW.LineStyle.Dashed});
+    let pane = 1; this.paneOf = {};
+    if (I.rsi.on) { this.paneOf.rsi = pane;
+      this.ind.rsi = line(COL.rsi, 1.5, pane, {lastValueVisible: true});
+      [70, 50, 30].forEach(v => this.ind.rsi.createPriceLine({price: v, color: v === 50 ? "#334155" : "#475569",
+        lineStyle: LW.LineStyle.Dashed, lineWidth: 1, axisLabelVisible: false}));
+      pane++; }
+    if (I.macd.on) { this.paneOf.macd = pane;
+      this.ind.hist = this.chart.addSeries(LW.HistogramSeries, {priceLineVisible: false, lastValueVisible: false}, pane);
+      this.ind.macd = line(COL.macd, 1.5, pane, {lastValueVisible: true}); this.ind.sig = line(COL.sig, 1.2, pane);
+      pane++; }
+    if (I.atr.on) { this.paneOf.atr = pane; this.ind.atr = line(COL.atr, 1.5, pane, {lastValueVisible: true}); pane++; }
+    try { const ps = this.chart.panes(); for (let i = 1; i < ps.length; i++) ps[i].setHeight(90); } catch (e) {}
+    this.cmp = null;
+    if (S.cmp && S.layout === this.sym) {
+      this.chart.applyOptions({leftPriceScale: {visible: true}});
+      this.cmp = line("#e2e8f0", 1.2, 0, {priceScaleId: "left", lastValueVisible: true,
+        priceFormat: {type: "custom", formatter: v => sgn(v) + "%"}});
+      this.cmpMain = line("rgba(0,0,0,0)", 1, 0, {priceScaleId: "left"});   // anchors the left scale to this index
+    }
+    this.lines = []; this.drawSeries = [];
+    this.chart.subscribeCrosshairMove(p => this.onCross(p));
+    this.chart.subscribeClick(p => onChartClick(this, p));
+    this.chart.timeScale().subscribeVisibleLogicalRangeChange(r => syncRange(this, r));
+    this.el.onmousemove = e => onMouseMove(this, e);
+    this.render(fresh || !keep);
+    if (keep) this.chart.timeScale().setVisibleLogicalRange(keep);
+  }
+  data() { return DATA[this.sym]; }
+  render(initial) {
+    const d = this.data();
+    const empty = this.el.querySelector(".empty");
+    if (!d || !d.m1 || !d.m1.length) { empty.style.display = "flex"; empty.textContent = d ? "No intraday data yet" : "Loading…"; return; }
+    empty.style.display = "none";
+    let bars = S.tf >= 1440 ? dailyBars(this.sym) : resample(d.m1, S.tf);
+    this.raw = bars;
+    const shown = S.type === "ha" ? heikin(bars) : bars;
+    this.bars = shown;
+    this.main.setData(S.type === "line" || S.type === "area" ? shown.map(b => ({time: b.time, value: b.close})) : shown);
+    this.computeIndicators(bars);
+    this.drawLevels();
+    this.drawDrawings();
+    this.drawCompare();
+    this.header();
+    if (initial) this.showDays();
+    this.onCross(null);
+  }
+  update() {          // one tick: update the forming candle without resetting the view
+    const d = this.data();
+    if (!d || !d.m1.length) return this.render(true);
+    const bars = S.tf >= 1440 ? dailyBars(this.sym) : resample(d.m1, S.tf);
+    if (!this.raw || bars.length < this.raw.length || bars.length > this.raw.length + 1) return this.render(false);
+    const isNew = bars.length !== this.raw.length;
+    this.raw = bars;
+    const shown = S.type === "ha" ? heikin(bars) : bars;
+    this.bars = shown;
+    const last = shown[shown.length - 1];
+    this.main.update(S.type === "line" || S.type === "area" ? {time: last.time, value: last.close} : last);
+    this.computeIndicators(bars);
+    if (isNew || ++this.ticks % 15 === 0) this.drawLevels();
+    this.drawCompare();
+    this.header();
+    if (!this.crossing) this.onCross(null);
+  }
+  computeIndicators(b) {
+    const c = b.map(x => x.close), T = b.map(x => x.time), I = S.ind, X = this.ind;
+    const put = (s, vals) => s && s.setData(vals.map((v, i) => v == null ? {time: T[i]} : {time: T[i], value: v}));
+    this.vals = {};
+    const keepV = (k, v) => { this.vals[k] = v; return v; };
+    if (X.ema1) put(X.ema1, keepV("ema1", ema(c, I.ema1.n)));
+    if (X.ema2) put(X.ema2, keepV("ema2", ema(c, I.ema2.n)));
+    if (X.sma) put(X.sma, keepV("sma", sma(c, I.sma.n)));
+    if (X.bbM) { const m = sma(c, I.bb.n), sd = stdev(c, I.bb.n, m);
+      put(X.bbM, m); put(X.bbU, keepV("bbU", m.map((v, i) => v == null ? null : v + I.bb.k * sd[i])));
+      put(X.bbL, keepV("bbL", m.map((v, i) => v == null ? null : v - I.bb.k * sd[i]))); }
+    if (X.st) { const st = supertrend(b, I.st.n, I.st.k); this.vals.st = st;
+      X.st.setData(st.map((x, i) => x ? {time: T[i], value: x.v, color: x.dir === 1 ? COL.st_up : COL.st_dn} : {time: T[i]})); }
+    if (X.vw) put(X.vw, keepV("vw", sessionVwap(b)));
+    if (X.rsi) put(X.rsi, keepV("rsi", rsi(c, I.rsi.n)));
+    if (X.macd) { const f = ema(c, 12), s = ema(c, 26), m = f.map((v, i) => v == null || s[i] == null ? null : v - s[i]);
+      const first = m.findIndex(v => v != null);
+      const sigRaw = first < 0 ? [] : ema(m.slice(first), 9);
+      const sig = m.map((_, i) => i < first || first < 0 ? null : sigRaw[i - first]);
+      put(X.macd, keepV("macd", m)); put(X.sig, keepV("sig", sig));
+      X.hist.setData(m.map((v, i) => v == null || sig[i] == null ? {time: T[i]} : {time: T[i], value: v - sig[i],
+        color: v - sig[i] >= 0 ? "rgba(34,197,94,.6)" : "rgba(239,68,68,.6)"}));
+      this.vals.hist = m.map((v, i) => v == null || sig[i] == null ? null : v - sig[i]); }
+    if (X.atr) put(X.atr, keepV("atr", rma(trueRange(b), I.atr.n)));
+  }
+  // ---------------------------------------------------------------- levels
+  levelList() {
+    const d = this.data(), L = S.lv, out = [], ss = sessions(d.m1), today = ss[ss.length - 1];
+    let prev = ss.length > 1 ? hlc(ss[ss.length - 2]) : null;
+    if (!prev && d.d1 && d.d1.length) {
+      const t0 = today ? dayOf(today[0][0]) : Infinity, p = d.d1.filter(b => dayOf(b[0]) < t0).slice(-1)[0];
+      if (p) prev = {o: p[1], h: p[2], l: p[3], c: p[4]};
+    }
+    const add = (title, price, color, style = LW.LineStyle.Dashed, width = 1) => price && out.push({title, price, color, style, width});
+    if (prev) {
+      if (L.pd) { add("PDH", prev.h, "#94a3b8"); add("PDL", prev.l, "#94a3b8"); add("PDC", prev.c, "#38bdf8"); }
+      const P = (prev.h + prev.l + prev.c) / 3, R = prev.h - prev.l;
+      if (L.cpr) { const bc = (prev.h + prev.l) / 2, tc = 2 * P - bc;
+        add("Pivot", P, "#eab308", LW.LineStyle.Solid); add("TC", Math.max(bc, tc), "#ca8a04", LW.LineStyle.Dotted);
+        add("BC", Math.min(bc, tc), "#ca8a04", LW.LineStyle.Dotted); }
+      if (L.piv) { add("R1", 2 * P - prev.l, "#f87171", LW.LineStyle.Dotted); add("S1", 2 * P - prev.h, "#4ade80", LW.LineStyle.Dotted);
+        add("R2", P + R, "#f87171", LW.LineStyle.Dotted); add("S2", P - R, "#4ade80", LW.LineStyle.Dotted);
+        add("R3", prev.h + 2 * (P - prev.l), "#f87171", LW.LineStyle.Dotted); add("S3", prev.l - 2 * (prev.h - P), "#4ade80", LW.LineStyle.Dotted); }
+      if (L.cam) { const k = R * 1.1;
+        add("H4", prev.c + k / 2, "#fb7185", LW.LineStyle.LargeDashed); add("H3", prev.c + k / 4, "#fda4af", LW.LineStyle.LargeDashed);
+        add("L3", prev.c - k / 4, "#86efac", LW.LineStyle.LargeDashed); add("L4", prev.c - k / 2, "#4ade80", LW.LineStyle.LargeDashed); }
+    }
+    if (L.pw && d.d1 && d.d1.length) {
+      const t0 = today ? dayOf(today[0][0]) : dayOf(d.d1[d.d1.length - 1][0]);
+      const wd = new Date(t0 * 1000).getUTCDay(), weekStart = t0 - ((wd + 6) % 7) * 86400;
+      const pw = d.d1.filter(b => b[0] < weekStart && b[0] >= weekStart - 7 * 86400);
+      if (pw.length) { add("PWH", Math.max(...pw.map(b => b[2])), "#c084fc"); add("PWL", Math.min(...pw.map(b => b[3])), "#c084fc"); }
+    }
+    if (today && today.length) {
+      if (L.dhl) { const t = hlc(today); add("DH", t.h, "#e2e8f0", LW.LineStyle.Dotted); add("DL", t.l, "#e2e8f0", LW.LineStyle.Dotted); }
+      if (L.orb) { const end = dayOf(today[0][0]) + (SESSION_OPEN + Number(L.orb_n)) * 60;
+        const orb = today.filter(b => b[0] < end);
+        if (orb.length && today[today.length - 1][0] >= end - 60) {
+          add(`ORH${L.orb_n}`, Math.max(...orb.map(b => b[2])), "#2dd4bf", LW.LineStyle.Dotted, 2);
+          add(`ORL${L.orb_n}`, Math.min(...orb.map(b => b[3])), "#2dd4bf", LW.LineStyle.Dotted, 2); } }
+    }
+    const ctx = d.ctx || {};
+    if (L.sr) (ctx.zones || []).forEach(z => {
+      const col = z.kind === "support" ? "rgba(34,197,94,.75)" : "rgba(239,68,68,.75)", nm = z.kind === "support" ? "Sup" : "Res";
+      add(`${nm} ${fmt(z.lo, 0)}–${fmt(z.hi, 0)}`, (z.lo + z.hi) / 2, col, LW.LineStyle.SparseDotted, 3); });
+    if (L.opt && ctx.options) {
+      const o = ctx.options;
+      (o.call_walls || []).slice(0, 2).forEach((w, i) => add(`CE wall${i ? " 2" : ""} ${fmt(w.strike, 0)}`, w.strike, "#fb923c", LW.LineStyle.Solid, i ? 1 : 2));
+      (o.put_walls || []).slice(0, 2).forEach((w, i) => add(`PE wall${i ? " 2" : ""} ${fmt(w.strike, 0)}`, w.strike, "#34d399", LW.LineStyle.Solid, i ? 1 : 2));
+      if (o.max_pain) add(`Max pain ${fmt(o.max_pain, 0)}`, o.max_pain, "#e879f9", LW.LineStyle.Dashed, 1);
+    }
+    if (L.pos) (ctx.positions || []).forEach(p => add(`${p.qty < 0 ? "Short" : "Long"} ${fmt(p.strike, 0)} ${p.kind} ×${Math.abs(p.lots)}`,
+      p.strike, p.qty < 0 ? "#f59e0b" : "#60a5fa", LW.LineStyle.Solid, 2));
+    return out;
+  }
+  drawLevels() {
+    this.lines.forEach(l => { try { this.main.removePriceLine(l); } catch (e) {} });
+    this.lines = this.levelList().map(l => this.main.createPriceLine({price: l.price, color: l.color, lineWidth: l.width,
+      lineStyle: l.style, axisLabelVisible: true, title: l.title}));
+    (S.alerts || []).filter(a => a.sym === this.sym && a.on).forEach(a => this.lines.push(this.main.createPriceLine({
+      price: a.price, color: "#f59e0b", lineWidth: 1, lineStyle: LW.LineStyle.LargeDashed, axisLabelVisible: true,
+      title: "⏰ alert"})));
+  }
+  // ---------------------------------------------------------------- drawings
+  drawDrawings() {
+    this.drawSeries.forEach(s => this.chart.removeSeries(s)); this.drawSeries = [];
+    (this.hlines || []).forEach(l => { try { this.main.removePriceLine(l); } catch (e) {} }); this.hlines = [];
+    const list = S.drawings[this.sym] || [];
+    const times = new Set(this.bars.map(b => b.time));
+    const snap = t => { const k = bucket(t, S.tf); return times.has(k) ? k : null; };
+    for (const dr of list) {
+      if (dr.type === "h") this.hlines.push(this.main.createPriceLine({price: dr.price, color: "#fbbf24", lineWidth: 1,
+        lineStyle: LW.LineStyle.Solid, axisLabelVisible: true, title: ""}));
+      if (dr.type === "t") {
+        const a = snap(dr.a.t), b = snap(dr.b.t);
+        if (a == null || b == null || a === b) continue;
+        const pts = [{time: a, value: dr.a.p}, {time: b, value: dr.b.p}].sort((x, y) => x.time - y.time);
+        const s = this.chart.addSeries(LW.LineSeries, {color: "#fbbf24", lineWidth: 2, priceLineVisible: false,
+          lastValueVisible: false, crosshairMarkerVisible: false, autoscaleInfoProvider: () => null}, 0);
+        s.setData(pts); this.drawSeries.push(s);
+      }
+    }
+  }
+  // ---------------------------------------------------------------- compare overlay
+  drawCompare() {
+    if (!this.cmp) return;
+    const other = SYMS.find(s => s.id !== this.sym), od = DATA[other.id];
+    if (!od || !od.m1.length) return;
+    const ob = S.tf >= 1440 ? dailyBars(other.id) : resample(od.m1, S.tf), map = new Map(ob.map(b => [b.time, b.close]));
+    // both rebased to 0% at the first candle they share, like TradingView's compare
+    const first = this.raw.find(b => map.has(b.time));
+    if (!first) return;
+    const base = map.get(first.time), mine = first.close;
+    this.cmp.applyOptions({title: `${other.name} %`});
+    this.cmp.setData(this.raw.filter(b => map.has(b.time)).map(b => ({time: b.time, value: (map.get(b.time) / base - 1) * 100})));
+    this.cmpMain.setData(this.raw.map(b => ({time: b.time, value: (b.close / mine - 1) * 100})));
+  }
+  prevClose(sym) {
+    const d = DATA[sym], ss = sessions(d.m1);
+    if (ss.length > 1) return ss[ss.length - 2].slice(-1)[0][4];
+    return (d.ctx || {}).prev_close || null;
+  }
+  // ---------------------------------------------------------------- header / legend
+  header() {
+    const d = this.data(), ss = sessions(d.m1), today = hlc(ss[ss.length - 1]), pc = this.prevClose(this.sym);
+    const last = d.m1[d.m1.length - 1][4];
+    this.lastPx = last;
+    this.cell.querySelector(".px").textContent = fmt(last);
+    const ch = this.cell.querySelector(".ch");
+    if (pc) { ch.textContent = `${sgn(last - pc)} (${sgn((last / pc - 1) * 100)}%)`; ch.style.color = clr(last - pc); }
+    const lastT = d.m1[d.m1.length - 1][0];
+    let meta = new Date(lastT * 1000).toUTCString().slice(0, 22) + " IST";
+    const now = Date.now() / 1000 + 19800, mod = minOfDay(now);
+    if (S.tf < 1440 && mod >= SESSION_OPEN && mod < SESSION_CLOSE && dayOf(now) === dayOf(lastT)) {
+      const next = Math.min(bucket(now, S.tf) + S.tf * 60, dayOf(now) + SESSION_CLOSE * 60), left = Math.max(0, Math.round(next - now));
+      meta += ` · candle closes in ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`;
+    }
+    this.cell.querySelector(".meta").innerHTML = meta + ` · <span style="color:${SRC.live ? COL.up : COL.ema1}">● ${SRC.live ? "real-time" : "delayed"}</span>`;
+    if (today) {
+      const rng = today.h - today.l, pos = rng ? (last - today.l) / rng * 100 : 50;
+      const parts = [`O ${fmt(today.o, 1)}`, `H ${fmt(today.h, 1)}`, `L ${fmt(today.l, 1)}`, `Range ${fmt(rng, 1)}`,
+                     `at ${pos.toFixed(0)}% of range`, `vs open ${sgn(last - today.o, 1)}`];
+      const atr = this.vals && this.vals.atr;
+      if (atr && atr[atr.length - 1]) parts.push(`ATR ${fmt(atr[atr.length - 1], 1)}`);
+      const st = this.vals && this.vals.st, stl = st && st[st.length - 1];
+      if (stl) parts.push(`Supertrend <b style="color:${stl.dir === 1 ? COL.up : COL.down}">${stl.dir === 1 ? "UP" : "DOWN"}</b>`);
+      const r = this.vals && this.vals.rsi, rl = r && r[r.length - 1];
+      if (rl != null) parts.push(`RSI ${rl.toFixed(1)}${rl > 70 ? " overbought" : rl < 30 ? " oversold" : ""}`);
+      this.cell.querySelector(".sub").innerHTML = parts.join(" · ");
+    }
+  }
+  onCross(p) {
+    this.crossing = !!(p && p.time);
+    let i = this.bars.length - 1;
+    if (p && p.time != null) { const k = this.bars.findIndex(b => b.time === p.time); if (k >= 0) i = k; }
+    const b = this.bars[i];
+    if (!b) { this.legend.innerHTML = ""; return; }
+    const prev = this.bars[i - 1], ch = prev ? b.close - prev.close : 0, pct = prev ? ch / prev.close * 100 : 0;
+    const v = (k, d = 1) => this.vals && this.vals[k] && this.vals[k][i] != null ? fmt(this.vals[k][i], d) : "—";
+    const tfName = TFS.find(x => x[1] === S.tf)[0];
+    let h = `<div class="row"><b style="color:${COL.text}">${this.name} · ${tfName}${S.tf < 1440 ? (S.tf < 60 ? "m" : "") : ""}</b> ` +
+      `<span style="color:${clr(b.close - b.open)}">O <b>${fmt(b.open)}</b> H <b>${fmt(b.high)}</b> L <b>${fmt(b.low)}</b> ` +
+      `C <b>${fmt(b.close)}</b> ${sgn(ch)} (${sgn(pct)}%)</span></div>`;
+    const ov = [];
+    if (this.ind.ema1) ov.push(`<span style="color:${COL.ema1}">EMA ${S.ind.ema1.n} ${v("ema1")}</span>`);
+    if (this.ind.ema2) ov.push(`<span style="color:${COL.ema2}">EMA ${S.ind.ema2.n} ${v("ema2")}</span>`);
+    if (this.ind.sma) ov.push(`<span style="color:${COL.sma}">SMA ${S.ind.sma.n} ${v("sma")}</span>`);
+    if (this.ind.bbU) ov.push(`<span style="color:${COL.bb}">BB ${v("bbU")} / ${v("bbL")}</span>`);
+    if (this.ind.st && this.vals.st[i]) ov.push(`<span style="color:${this.vals.st[i].dir === 1 ? COL.up : COL.down}">ST ${fmt(this.vals.st[i].v, 1)}</span>`);
+    if (this.ind.vw) ov.push(`<span style="color:${COL.vw}">VWAP* ${v("vw")}</span>`);
+    if (this.ind.rsi) ov.push(`<span style="color:${COL.rsi}">RSI ${v("rsi")}</span>`);
+    if (this.ind.macd) ov.push(`<span style="color:${COL.macd}">MACD ${v("macd", 2)} / ${v("sig", 2)} / ${v("hist", 2)}</span>`);
+    if (this.ind.atr) ov.push(`<span style="color:${COL.atr}">ATR ${v("atr")}</span>`);
+    if (ov.length) h += `<div class="row">${ov.join(" &nbsp;")}</div>`;
+    this.legend.innerHTML = h;
+  }
+  showDays() {
+    const n = Number(S.days), ts = this.chart.timeScale();
+    if (S.tf >= 1440) { const k = this.bars.length; ts.setVisibleLogicalRange({from: Math.max(k - 120, 0), to: k + 4}); return; }
+    if (!n) { ts.fitContent(); return; }
+    const days = [...new Set(this.bars.map(b => dayOf(b.time)))], from = days[Math.max(days.length - n, 0)];
+    const i0 = this.bars.findIndex(b => b.time >= from);
+    ts.setVisibleLogicalRange({from: Math.max(i0, 0), to: this.bars.length + 4});
+  }
+}
+
+// ------------------------------------------------------------------ interactions
+function setMode(m) {
+  MODE = MODE === m ? null : m; PENDING = null;
+  document.querySelectorAll("[data-mode]").forEach(b => b.classList.toggle("on", b.dataset.mode === MODE));
+  const tip = {h: "click to place a horizontal line", t: "click the first point of the trend line",
+               m: "click the start point to measure", a: "click a price to set an alert"};
+  document.getElementById("mode").textContent = MODE ? `✎ ${tip[MODE]} · Esc to cancel` : "";
+  Object.values(VIEWS).forEach(v => { v.measureEl.style.display = "none"; });
+}
+function onChartClick(view, p) {
+  if (!MODE || !p.point) return;
+  const price = view.main.coordinateToPrice(p.point.y);
+  if (price == null) return;
+  if (MODE === "h") { (S.drawings[view.sym] = S.drawings[view.sym] || []).push({type: "h", price}); view.drawDrawings(); save(); setMode(null); }
+  else if (MODE === "a") { addAlert(view.sym, price); setMode(null); }
+  else if (MODE === "t" || MODE === "m") {
+    if (p.time == null) return;
+    if (!PENDING) { PENDING = {view, t: p.time, p: price, x: p.point.x, y: p.point.y};
+      document.getElementById("mode").textContent = `✎ click the second point · Esc to cancel`; return; }
+    if (PENDING.view !== view) return;
+    if (MODE === "t") {
+      (S.drawings[view.sym] = S.drawings[view.sym] || []).push({type: "t", a: {t: PENDING.t, p: PENDING.p}, b: {t: p.time, p: price}});
+      view.drawDrawings(); save(); setMode(null);
+    } else { PENDING.done = true; MODE = "m-done"; document.getElementById("mode").textContent = "Measure · Esc to clear"; }
+  }
+}
+function onMouseMove(view, e) {
+  if (!PENDING || PENDING.view !== view || PENDING.done || MODE !== "m") return;
+  const r = view.el.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+  const p2 = view.main.coordinateToPrice(y), t2 = view.chart.timeScale().coordinateToTime(x);
+  if (p2 == null) return;
+  const el = view.measureEl, d = p2 - PENDING.p;
+  el.style.display = "block"; el.classList.toggle("dn", d < 0);
+  el.style.left = Math.min(PENDING.x, x) + "px"; el.style.top = Math.min(PENDING.y, y) + "px";
+  el.style.width = Math.abs(x - PENDING.x) + "px"; el.style.height = Math.abs(y - PENDING.y) + "px";
+  const i1 = view.bars.findIndex(b => b.time === PENDING.t), i2 = t2 == null ? -1 : view.bars.findIndex(b => b.time === t2);
+  const nb = i1 >= 0 && i2 >= 0 ? Math.abs(i2 - i1) : null, secs = t2 != null ? Math.abs(t2 - PENDING.t) : null;
+  const dur = secs == null ? "" : secs >= 86400 ? ` · ${(secs / 86400).toFixed(1)}d` : ` · ${Math.floor(secs / 3600)}h ${Math.round(secs % 3600 / 60)}m`;
+  el.querySelector(".tag").textContent = `${sgn(d, 1)} (${sgn(d / PENDING.p * 100)}%)` + (nb != null ? ` · ${nb} bars` : "") + dur;
+}
+let syncing = false;
+function syncRange(src, r) {
+  if (!S.sync || syncing || !r || S.layout === "^NSEI" || S.layout === "NIFTY BANK") return;
+  syncing = true;
+  Object.values(VIEWS).forEach(v => { if (v !== src && v.bars.length) v.chart.timeScale().setVisibleLogicalRange(r); });
+  syncing = false;
+}
+function syncCross(src, p) {
+  Object.values(VIEWS).forEach(v => {
+    if (v === src) return;
+    if (!S.sync || !p || p.time == null) { v.chart.clearCrosshairPosition(); return; }
+    const b = v.bars.find(x => x.time === p.time);
+    if (b) v.chart.setCrosshairPosition(b.close, p.time, v.main); else v.chart.clearCrosshairPosition();
+  });
+}
+
+// ------------------------------------------------------------------ alerts
+function addAlert(sym, price) {
+  price = Math.round(price * 20) / 20;
+  const v = VIEWS[sym];
+  S.alerts.push({id: Date.now() + Math.random(), sym, price, on: true, from: v ? v.lastPx : null,
+                 created: new Date().toISOString().slice(0, 16)});
+  save(); renderAlerts(); Object.values(VIEWS).forEach(x => x.drawLevels());
+}
+function checkAlerts(sym, prev, now) {
+  if (prev == null || now == null || prev === now) return;
+  let fired = false;
+  for (const a of S.alerts) {
+    if (!a.on || a.sym !== sym) continue;
+    if ((prev < a.price && now >= a.price) || (prev > a.price && now <= a.price)) {
+      a.on = false; a.fired = new Date().toISOString().slice(11, 19); fired = true;
+      const name = SYMS.find(s => s.id === sym).name, dir = now >= a.price ? "crossed above" : "crossed below";
+      const msg = `${name} ${dir} ${fmt(a.price)} (now ${fmt(now)})`;
+      toast("⏰ " + msg); beep(); py("alert", {sym, price: a.price, now, message: msg});
+    }
+  }
+  if (fired) { save(); renderAlerts(); Object.values(VIEWS).forEach(x => x.drawLevels()); }
+}
+function renderAlerts() {
+  const on = S.alerts.filter(a => a.on).length;
+  document.getElementById("btnAl").textContent = `Alerts (${on}) ▾`;
+  const list = document.getElementById("alList");
+  list.innerHTML = S.alerts.length ? "" : `<div style="color:var(--muted)">No alerts. Use ⏰ Alert and click the chart, or add one below.</div>`;
+  S.alerts.slice().reverse().forEach(a => {
+    const row = document.createElement("div"); row.className = "al";
+    const nm = SYMS.find(s => s.id === a.sym).name;
+    row.innerHTML = `<span style="color:${a.on ? COL.text : COL.muted}">${nm} ${fmt(a.price)} ${a.on ? "" : `· fired ${a.fired || ""}`}</span>`;
+    const x = document.createElement("span"); x.className = "x"; x.textContent = "✕";
+    x.onclick = () => { S.alerts = S.alerts.filter(z => z.id !== a.id); save(); renderAlerts(); Object.values(VIEWS).forEach(v => v.drawLevels()); };
+    row.appendChild(x); list.appendChild(row);
+  });
+}
+function toast(msg) {
+  const d = document.createElement("div"); d.textContent = msg;
+  document.getElementById("toast").appendChild(d); setTimeout(() => d.remove(), 12000);
+}
+function beep() {
+  try { const ac = new (window.AudioContext || window.webkitAudioContext)();
+    [0, 0.25].forEach(t => { const o = ac.createOscillator(), g = ac.createGain(); o.frequency.value = 880;
+      o.connect(g); g.connect(ac.destination); g.gain.setValueAtTime(0.15, ac.currentTime + t);
+      o.start(ac.currentTime + t); o.stop(ac.currentTime + t + 0.15); }); } catch (e) {}
+}
+
+// ------------------------------------------------------------------ toolbar
+function rebuildAll() { Object.values(VIEWS).forEach(v => v.build()); }
+function applyLayout() {
+  const main = document.getElementById("main");
+  main.classList.toggle("stack", S.layout === "stack");
+  Object.values(VIEWS).forEach(v => v.cell.classList.toggle("hidden", !(S.layout === "both" || S.layout === "stack" || S.layout === v.sym)));
+  document.getElementById("layout").value = S.layout;
+  document.getElementById("cmp").disabled = !(S.layout === "^NSEI" || S.layout === "NIFTY BANK");
+}
+function syncControls() {
+  document.querySelectorAll("#tfs button").forEach(b => b.classList.toggle("on", Number(b.dataset.tf) === S.tf));
+  document.getElementById("days").value = String(S.days);
+  document.getElementById("ctype").value = S.type;
+  document.getElementById("sync").classList.toggle("on", S.sync);
+  document.getElementById("cmp").classList.toggle("on", S.cmp);
+  document.getElementById("days").disabled = S.tf >= 1440;
+  for (const [k, o] of Object.entries(S.ind)) {
+    const cb = document.getElementById("i_" + k); if (cb) cb.checked = o.on;
+    const n = document.getElementById(`i_${k}_n`); if (n) n.value = o.n;
+    const kk = document.getElementById(`i_${k}_k`); if (kk) kk.value = o.k;
+  }
+  for (const [k, v] of Object.entries(S.lv)) { const cb = document.getElementById("l_" + k); if (cb && typeof v === "boolean") cb.checked = v; }
+  document.getElementById("l_orb_n").value = String(S.lv.orb_n);
+  applyLayout();
+}
+function popup(btn, id) {
+  const pop = document.getElementById(id), open = pop.style.display === "block";
+  document.querySelectorAll(".pop").forEach(p => p.style.display = "none");
+  if (open) return;
+  const r = btn.getBoundingClientRect();
+  pop.style.left = Math.min(r.left, window.innerWidth - 300) + "px"; pop.style.top = (r.bottom + 4) + "px"; pop.style.display = "block";
+}
+function initToolbar() {
+  const tfs = document.getElementById("tfs");
+  TFS.forEach(([name, m]) => { const b = document.createElement("button"); b.textContent = name; b.dataset.tf = m;
+    b.title = `${name} ${m < 1440 ? "minute" : ""} candles (key ${TFS.findIndex(x => x[1] === m) + 1})`;
+    b.onclick = () => { S.tf = m; save(); syncControls(); Object.values(VIEWS).forEach(v => { v.build(); v.showDays(); }); };
+    tfs.appendChild(b); });
+  document.getElementById("days").onchange = e => { S.days = Number(e.target.value); save(); Object.values(VIEWS).forEach(v => v.showDays()); };
+  document.getElementById("ctype").onchange = e => { S.type = e.target.value; save(); rebuildAll(); };
+  document.getElementById("layout").onchange = e => { S.layout = e.target.value; if (!(S.layout in VIEWS)) S.cmp = false;
+    save(); applyLayout(); rebuildAll(); syncControls(); };
+  document.getElementById("sync").onclick = () => { S.sync = !S.sync; save(); syncControls(); };
+  document.getElementById("cmp").onclick = () => { S.cmp = !S.cmp; save(); syncControls(); rebuildAll(); };
+  document.getElementById("fit").onclick = () => Object.values(VIEWS).forEach(v => v.chart.timeScale().fitContent());
+  document.getElementById("live").onclick = () => Object.values(VIEWS).forEach(v => v.chart.timeScale().scrollToRealTime());
+  document.getElementById("shot").onclick = () => {
+    const vis = Object.values(VIEWS).filter(v => !v.cell.classList.contains("hidden"));
+    vis.forEach(v => py("screenshot", {sym: v.name, data: v.chart.takeScreenshot().toDataURL("image/png")}));
+  };
+  document.querySelectorAll("[data-mode]").forEach(b => b.onclick = () => setMode(b.dataset.mode));
+  document.getElementById("undo").onclick = undo;
+  document.getElementById("clear").onclick = () => { S.drawings = {}; save(); Object.values(VIEWS).forEach(v => v.drawDrawings()); };
+  document.getElementById("btnInd").onclick = e => popup(e.target, "popInd");
+  document.getElementById("btnLv").onclick = e => popup(e.target, "popLv");
+  document.getElementById("btnAl").onclick = e => { renderAlerts(); popup(e.target, "popAl"); };
+  document.querySelectorAll("#popInd input").forEach(inp => inp.onchange = () => {
+    for (const [k, o] of Object.entries(S.ind)) {
+      const cb = document.getElementById("i_" + k); if (cb) o.on = cb.checked;
+      const n = document.getElementById(`i_${k}_n`); if (n && Number(n.value) >= 2) o.n = Math.round(Number(n.value));
+      const kk = document.getElementById(`i_${k}_k`); if (kk && Number(kk.value) > 0) o.k = Number(kk.value);
+    }
+    save(); rebuildAll();
+  });
+  document.querySelectorAll("#popLv input, #popLv select").forEach(inp => inp.onchange = () => {
+    for (const k of Object.keys(S.lv)) { const cb = document.getElementById("l_" + k); if (cb && cb.type === "checkbox") S.lv[k] = cb.checked; }
+    S.lv.orb_n = Number(document.getElementById("l_orb_n").value);
+    save(); Object.values(VIEWS).forEach(v => v.drawLevels());
+  });
+  const alSym = document.getElementById("alSym");
+  SYMS.forEach(s => { const o = document.createElement("option"); o.value = s.id; o.textContent = s.name; alSym.appendChild(o); });
+  document.getElementById("alAdd").onclick = () => { const p = Number(document.getElementById("alPx").value);
+    if (p > 0) { addAlert(alSym.value, p); document.getElementById("alPx").value = ""; } };
+  document.addEventListener("mousedown", e => { if (!e.target.closest(".pop") && !e.target.closest("#bar")) document.querySelectorAll(".pop").forEach(p => p.style.display = "none"); });
+  document.addEventListener("keydown", e => {
+    if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+    if (e.key === "Escape") { setMode(null); document.querySelectorAll(".pop").forEach(p => p.style.display = "none"); }
+    else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") undo();
+    else if (!e.metaKey && !e.ctrlKey && "htma".includes(e.key.toLowerCase())) setMode(e.key.toLowerCase());
+    else if (/^[1-8]$/.test(e.key)) document.querySelectorAll("#tfs button")[Number(e.key) - 1].click();
+  });
+}
+function undo() {
+  let best = null;
+  for (const [sym, list] of Object.entries(S.drawings)) if (list.length) best = sym;
+  if (best) { S.drawings[best].pop(); save(); VIEWS[best].drawDrawings(); }
+}
+
+// ------------------------------------------------------------------ API for Python
+window.App = {
+  init(state) {
+    if (state && typeof state === "object") {
+      S = Object.assign(JSON.parse(JSON.stringify(DEFAULT)), state);
+      S.ind = Object.assign(JSON.parse(JSON.stringify(DEFAULT.ind)), state.ind || {});
+      S.lv = Object.assign({}, DEFAULT.lv, state.lv || {});
+      S.drawings = state.drawings || {}; S.alerts = state.alerts || [];
+    }
+    syncControls(); renderAlerts(); rebuildAll();
+  },
+  setBars(sym, m1, d1) {
+    const d = DATA[sym] = DATA[sym] || {m1: [], d1: [], ctx: {}};
+    d.m1 = m1 || []; if (d1) d.d1 = d1;
+    const v = VIEWS[sym], first = !v.bars.length;
+    const prev = v.lastPx;
+    v.render(first);
+    checkAlerts(sym, prev, v.lastPx);
+  },
+  tick(sym, bar) {
+    const d = DATA[sym]; if (!d || !d.m1) return;
+    const m = d.m1, last = m[m.length - 1];
+    if (last && last[0] === bar[0]) m[m.length - 1] = bar; else if (!last || bar[0] > last[0]) m.push(bar); else return;
+    const v = VIEWS[sym], prev = v.lastPx;
+    if (!v.raw) v.render(true); else v.update();
+    checkAlerts(sym, prev, bar[4]);
+  },
+  setContext(sym, ctx) {
+    const d = DATA[sym] = DATA[sym] || {m1: [], d1: [], ctx: {}};
+    d.ctx = Object.assign(d.ctx || {}, ctx);
+    if (VIEWS[sym].bars.length) VIEWS[sym].drawLevels();
+  },
+  setSource(text, live) { SRC = {text, live}; Object.values(VIEWS).forEach(v => v.bars.length && v.header()); },
+};
+
+initToolbar();
+SYMS.forEach(s => { VIEWS[s.id] = new View(s.id, s.name, s.und); });
+Object.values(VIEWS).forEach(v => v.chart.subscribeCrosshairMove(p => syncCross(v, p)));
+syncControls();
+setInterval(() => Object.values(VIEWS).forEach(v => v.bars.length && v.header()), 1000);   // candle countdown
+py("ready");
+</script>
+</body>
+</html>

@@ -133,7 +133,7 @@ class DBHandler:
         self.macro: Collection = self.db["macro_series"]
         # broker / trade journal (see trades_engine.py); key fields per collection
         self.journal_keys = {"broker_fills": ("fill_id",), "broker_orders": ("order_no", "date"),
-                             "pnl_daily": ("date",), "trade_journal": ("strategy_id",)}
+                             "pnl_daily": ("date",), "trade_journal": ("strategy_id",), "ai_reviews": ("review_id",)}
         self.ensure_schema()
 
     # ------------------------------------------------------------ setup

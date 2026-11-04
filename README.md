@@ -110,6 +110,8 @@ plus the ETFs that track them.
 | `fii_dii_activity` | unique `date` | fii_cash_net, dii_cash_net, fii_index_futures_long_short_ratio, client_ratio, pcr, fii_index_fut_net_oi, … |
 | `sr_levels` | unique `(symbol, timeframe, calculated_date)` | support_zones[], resistance_zones[], poc_level, vah, val, pivots, projection, signal |
 | `macro_series` | unique `(series, date)` | close |
+| `broker_fills`, `broker_orders`, `pnl_daily`, `trade_journal` | unique `fill_id` / `(order_no, date)` / `date` / `strategy_id` | Trades & P&L tab data |
+| `ai_reviews` | unique `review_id` | time, model, preset, question, answer, tokens |
 
 Every write is an `UpdateOne(..., upsert=True)` keyed on the natural key, so running a sync again never duplicates data. FII cash and participant-OI records for the same date are merged with `$set`.
 
@@ -270,6 +272,34 @@ The zones, ranges and EOD signals come from the latest daily analysis stored in 
 
 Reading it during the session: a tile that reads **AT KEY SUPPORT** or **DIP BAND**, with an EOD signal of ACCUM or WATCH, is a dip-buy candidate, so open the chart and time the entry on 1H. **AT KEY RESISTANCE** or **RALLY BAND** with RSI stretched is where you book profits. **BELOW MONTHLY RANGE** means the month's support has broken, so wait for a base before buying.
 
+### Realtime chart tab (NIFTY / BANKNIFTY)
+A TradingView-style intraday chart for NIFTY 50 and BANKNIFTY, built on TradingView's open-source [Lightweight Charts](https://github.com/tradingview/lightweight-charts) v5 (Apache-2.0, bundled in `vendor/`, so it also works offline). The page is `chart_web/chart.html`; `rt_chart.py` feeds it.
+* **Data:**
+  * **With Shoonya connected:** 1-minute candles come from Shoonya's `TPSeries` (real-time, about 9 days back). The forming candle updates every second from the websocket ticks, and history is re-pulled every 2 minutes.
+  * **Without Shoonya:** Yahoo 1-minute bars (delayed) refresh every 30 seconds.
+  * **1D:** uses the stored daily bars, with today's candle built live.
+  * The header shows real-time or delayed, and a countdown to the candle close.
+* **Timeframes:** 1, 3, 5, 10, 15 and 30 min, 1H (anchored at 09:15) and 1D. Keys 1–8 switch between them. You can show 1, 2 or 5 days, or everything loaded.
+* **Chart types:** candles, Heikin Ashi, OHLC bars, line, area.
+* **Indicators:**
+  * Overlays (lengths editable): EMA ×2, SMA, Bollinger Bands, Supertrend, and a session VWAP. Index candles carry no volume, so the VWAP is equal-weighted.
+  * Separate, resizable panes: RSI with 70/50/30 lines, MACD 12/26/9 with histogram, and ATR.
+* **Levels:**
+  * Previous day high, low and close; CPR (pivot, BC, TC); classic pivots R1–R3 / S1–S3; Camarilla H3/H4/L3/L4.
+  * Previous week high and low; today's high and low; the opening range (5, 15 or 30 min).
+  * From the app:
+    * daily support and resistance zones from `sr_levels`;
+    * option OI walls (top call and put strikes) and max pain from the Options analysis, refreshed every 15 minutes;
+    * your open option strikes from the Trades tab, e.g. "Short 23,700 CE ×2".
+* **Tools:**
+  * **Drawing:** horizontal line (H), trend line (T), measure (M: points, %, bars and time between two clicks), undo (Ctrl+Z) and clear.
+  * **Price alerts:** press A and click a price, or type one in the Alerts menu. An alert fires once when the live price crosses it, with an in-chart banner, a sound, a status-bar message and a dock bounce. Alerts keep working while you're on another tab, as long as Shoonya is connected.
+* **Layout:**
+  * Side by side, stacked, or a single index.
+  * **Sync** links the crosshair and scrolling of the two charts. **Compare** overlays the other index's % move on a single chart.
+  * **Fit**, **Latest**, and 📷 to save a PNG. The legend shows OHLC, change and every indicator value at the crosshair.
+* **Saved state:** settings, drawings and alerts are kept in `~/.nse_analytics/chart_state.json`.
+
 ### Scanner tab
 **Scanner — all indices → Scan** runs the daily analysis for all 56 instruments (34 indices and 22 ETFs) and saves each result to `sr_levels`. The table shows:
 
@@ -347,6 +377,9 @@ The tab reads your Shoonya account through read-only calls (PositionBook, OrderB
 * **Journal:** tags (no stop, FOMO, revenge, oversized…), a rating and notes per strategy, plus P&L by tag.
 * **Carried-forward positions:** Shoonya only lists today's trades. A position carried from an earlier session is recorded once at Shoonya's average price, marked "carry-forward" because its real entry date is unknown, so it reaches the history when you close it. Use **Import CSV…** for older trades from a broker export (date, symbol, buy/sell, qty, price).
 * **Settings:** `TRADING_CAPITAL` (0 = use Shoonya's cash limit) and `TRADES_SYNC_SECONDS` are in `config.py`.
+* **AI coach (local LLM):** a sub-tab that sends the numbers this tab computed (metrics, breakdowns, the *Why I lost* findings, open positions with alerts, and your last 30 strategies with market context at entry, mistakes and journal notes) to a model running locally in [Ollama](https://ollama.com). Nothing leaves your machine. One-click reviews: *Full review*, *Why am I losing?*, *Open positions*, *Last trade post-mortem* and *Personal pre-trade checklist*. You can also ask your own questions and follow-ups. Answers stream in as markdown and are saved to `ai_reviews`, listed on the left for later comparison. The model is told to quote your numbers, flag thin samples, check open positions against your management plan, and not forecast the market. It is an automated review for self-study, not investment advice.
+  * **Setup:** `brew install ollama` (or the app from ollama.com), then `ollama pull qwen3:14b`. The app starts `ollama serve` itself if it isn't running.
+  * **Model choice:** `qwen3:14b` (~9.3 GB) is the default. It reasons well over numbers and fits in 24 GB of memory alongside the app. `gpt-oss:20b` (~14 GB) is a slightly stronger, slower alternative; `qwen3:8b` (~5 GB) suits 16 GB machines. Finance-specific fine-tunes are generally weaker than these general reasoning models at this kind of analysis. Set `AI_MODEL` / `OLLAMA_HOST` in `.env` to change the default or the server. *Deep thinking* lets the model reason before answering: slower, but more careful.
 
 ### Options tab (NIFTY / BANKNIFTY option selling)
 

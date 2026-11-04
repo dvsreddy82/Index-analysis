@@ -19,6 +19,7 @@ import sys
 import time
 import traceback
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import pandas as pd
@@ -45,7 +46,11 @@ from shoonya_feed import (INDEX_TOKENS, REDIRECT_URL, VIX_TOKEN, OAuthCatcher, S
 from data_fetcher import pick_expiry
 import trades_engine as te
 from trades_view import TradesDashboard
+from ai_view import AICoachPanel
+from rt_chart import SYMBOLS as RT_SYMBOLS, RealtimeCharts
+from data_fetcher import fetch_intraday_1m
 
+IST = ZoneInfo(config.IST)
 log = logging.getLogger("app")
 
 # ------------------------------------------------------------------ theme
@@ -328,6 +333,19 @@ class MainWindow(QMainWindow):
         self.live.interval_changed.connect(lambda s: self.live_timer.setInterval(s * 1000))
         self.tabs = QTabWidget()
         self.tabs.addTab(self.live, "● Live — all indices")
+        self.rtc = RealtimeCharts()
+        self.rtc.reload_requested.connect(lambda: self.load_rt_chart(force=True))
+        self.rtc.broker_requested.connect(self.connect_shoonya)
+        self.rtc.alert_fired.connect(self._chart_alert)
+        self.tabs.addTab(self.rtc, "Realtime chart — NIFTY / BANKNIFTY")
+        self._rtc_busy = False
+        self._rtc_loaded = 0.0
+        self._rtc_source = ""
+        self._chart_opt_busy: set[str] = set()
+        self.rtc_timer = QTimer(self)        # tick-by-tick candle updates while the chart tab is open
+        self.rtc_timer.setInterval(1000)
+        self.rtc_timer.timeout.connect(self._rtc_tick)
+        self.rtc_timer.start()
         self.tabs.addTab(self.web, "Chart")
         self.tabs.addTab(self._build_scanner(), "Scanner")
         self.opts = OptionsDashboard()
@@ -341,7 +359,9 @@ class MainWindow(QMainWindow):
         self.trades.import_requested.connect(self.import_trades)
         self.trades.journal_saved.connect(self.save_journal)
         self.trades.connect_requested.connect(self.connect_shoonya)
-        self.tabs.addTab(self.trades, "Trades & P&L")
+        self.ai = AICoachPanel(lambda: self.trades.data, self.svc.store, lambda: self.trades.period.currentText())
+        self.trades.tabs.addTab(self.ai, "AI coach (local LLM)")
+        self.tabs.addTab(self.trades, "Trades && P&&L")
         self._opt_ctx: dict[str, tuple[float, dict]] = {}
         self._trades_busy = False
         self._trades_pending: bool | None = None
@@ -395,7 +415,10 @@ class MainWindow(QMainWindow):
     def _tab_changed(self, idx: int):
         page = self.tabs.widget(idx)
         self.panel.setVisible(page is self.web)
-        self.sidebar.setVisible(page not in (self.live, self.opts, self.trades))
+        self.sidebar.setVisible(page not in (self.live, self.opts, self.trades, self.rtc))
+        if page is self.rtc:
+            self.load_rt_chart()
+            self._chart_option_levels()
         if page is self.web:
             # Sidebar ~15%, signal panel ~26% (min 340px), chart gets the rest.
             w = self.split.width()
@@ -469,6 +492,7 @@ class MainWindow(QMainWindow):
     def _options_done(self, res: dict):
         self._opt_busy = False
         self._opt_ctx[res["underlying"]] = (time.time(), res)      # stamped on new fills (Trades tab)
+        self.rtc.set_option_levels(res["underlying"], res)          # OI walls / max pain on the chart
         self.opts.set_result(res)
         self._options_next()
 
@@ -509,6 +533,99 @@ class MainWindow(QMainWindow):
         if self.shoonya.live and self._last_snap and self.tabs.currentWidget() is self.live:
             self._show_snapshot()
         self._broker_label()
+
+    # ---------------------------------------------------------- realtime chart
+    RT_RELOAD_LIVE, RT_RELOAD_DELAYED = 120, 30   # seconds between history re-pulls
+
+    def load_rt_chart(self, force: bool = False):
+        """Seed / reconcile the intraday candles: Shoonya TPSeries when connected,
+        otherwise Yahoo 1-minute bars (delayed)."""
+        if self._rtc_busy:
+            return
+        live = self.shoonya.live
+        every = self.RT_RELOAD_LIVE if live else self.RT_RELOAD_DELAYED
+        if not force and time.time() - self._rtc_loaded < every:
+            return
+        self._rtc_busy = True
+        feed, svc = self.shoonya, self.svc
+
+        def job(_progress):
+            out, src = {}, ""
+            if live:
+                try:
+                    for sym, _ in RT_SYMBOLS:
+                        out[sym] = feed.time_series(INDEX_TOKENS[sym], time.time() - 9 * 86400)
+                    src = "Shoonya real-time · 1-min candles + live ticks"
+                except Exception as exc:          # fall back rather than leave the chart empty
+                    log.warning("TPSeries failed, using Yahoo: %s", exc)
+                    out = {}
+            if not out:
+                out = {sym: fetch_intraday_1m(sym, 7) for sym, _ in RT_SYMBOLS}
+                src = "Yahoo 1-min (delayed) — connect Shoonya for real-time"
+            daily = {}
+            for sym, _ in RT_SYMBOLS:
+                try:
+                    daily[sym] = svc.load_ohlcv(sym, "1D")
+                except Exception as exc:
+                    log.warning("daily bars for chart: %s", exc)
+            return out, src, daily
+
+        task = Task(job)
+        task.signals.done.connect(self._rtc_done)
+        task.signals.failed.connect(self._rtc_failed)
+        self._start(task)
+
+    def _rtc_done(self, payload):
+        data, src, daily = payload
+        for sym, df in daily.items():
+            self.rtc.set_daily(sym, df)
+        self._rtc_busy, self._rtc_loaded, self._rtc_source = False, time.time(), src
+        snap = self._last_snap or {}
+        for sym, _ in RT_SYMBOLS:
+            self.rtc.set_prev_close(sym, ((snap.get("quotes") or {}).get(sym) or {}).get("prev"))
+        self.rtc.set_history(data, src)
+
+    def _rtc_failed(self, err: str):
+        self._rtc_busy = False
+        self._rtc_loaded = time.time()
+        self.rtc.set_source(f"chart data failed: {err.splitlines()[0][:80]}")
+
+    def _rtc_tick(self):
+        if self.tabs.currentWidget() is self.rtc:
+            self.load_rt_chart()                   # no-op until the reload interval has passed
+        if not self.shoonya.live or not self._rtc_loaded:
+            return                                 # ticks always flow while live, so chart alerts fire on any tab
+        now = datetime.now(IST).replace(tzinfo=None)
+        for sym, _ in RT_SYMBOLS:
+            t = self.shoonya.tick(INDEX_TOKENS[sym])
+            if self.shoonya._fresh(t):
+                if t.get("c"):
+                    self.rtc.set_prev_close(sym, _num(t.get("c")))
+                self.rtc.push_tick(sym, _num(t.get("lp")), now)
+
+    def _chart_option_levels(self):
+        """OI walls / max pain for the chart, refreshed at most every 15 min per underlying,
+        without touching what the Options tab is showing."""
+        for und in ("NIFTY", "BANKNIFTY"):
+            hit = self._opt_ctx.get(und)
+            if (hit and time.time() - hit[0] < 900) or und in self._chart_opt_busy:
+                continue
+            self._chart_opt_busy.add(und)
+            task = Task(lambda _p, u=und: self._options_analysis(u, None))
+
+            def done(res, u=und):
+                self._chart_opt_busy.discard(u)
+                self._opt_ctx[u] = (time.time(), res)
+                self.rtc.set_option_levels(u, res)
+
+            task.signals.done.connect(done)
+            task.signals.failed.connect(lambda _e, u=und: self._chart_opt_busy.discard(u))
+            self._start(task)
+
+    def _chart_alert(self, msg: str):
+        self._status(f"⏰ Chart alert: {msg}")
+        QApplication.beep()
+        QApplication.alert(self)                   # bounce the dock icon / flash the taskbar
 
     # ---------------------------------------------------------- trades & P&L
     SETTLE_SYMBOL = {"NIFTY": "^NSEI", "BANKNIFTY": "NIFTY BANK", "FINNIFTY": "NIFTY FINANCIAL SERVICES",
@@ -687,6 +804,7 @@ class MainWindow(QMainWindow):
     def _trades_done(self, d: dict):
         self._trades_busy = False
         self.trades.set_data(d)
+        self.rtc.set_positions(d.get("positions") or [])         # my strikes on the chart
         self._trades_next()
 
     def _trades_failed(self, err: str):
@@ -783,6 +901,7 @@ class MainWindow(QMainWindow):
         if self.tabs.currentWidget() is self.opts:
             self.opts.request()
         self.sync_trades(pull=True)
+        self.load_rt_chart(force=True)            # re-seed the intraday chart from real-time candles
 
     def _shoonya_failed(self, err: str, retry_settings: dict | None = None):
         self.broker_btn.setEnabled(True)
@@ -809,6 +928,8 @@ class MainWindow(QMainWindow):
         for b in (self.broker_btn, self.opts.broker, self.live.broker):
             b.setStyleSheet(style)
             b.setEnabled(self.broker_btn.isEnabled())
+        self.rtc.broker.setText(head)
+        self.rtc.broker.setStyleSheet(style)
         self.opts.broker.setText(head)
         self.live.broker.setText(head)
         self.trades.connect_btn.setText(head)
@@ -859,6 +980,7 @@ class MainWindow(QMainWindow):
     def _levels_done(self, payload):
         levels, flows, history = payload
         self.live.set_levels(levels)
+        self.rtc.set_levels(levels)
         self.live.set_history(history)
         if flows:
             self.live.set_flows(*flows)

@@ -75,6 +75,19 @@ def fetch_ohlcv(symbol: str, timeframe: str = "1D", start: datetime | None = Non
     return df
 
 
+def fetch_intraday_1m(symbol: str, days: int = 5) -> list[tuple]:
+    """1-minute candles from Yahoo (delayed fallback when no broker feed), oldest
+    first, as (datetime IST-naive, open, high, low, close)."""
+    inst = config.INSTRUMENTS.get(symbol)
+    h = yf.Ticker(inst.yahoo if inst else symbol).history(period=f"{days}d", interval="1m", auto_adjust=False)
+    if h is None or h.empty:
+        return []
+    idx = h.index.tz_convert(config.IST).tz_localize(None) if h.index.tz is not None else h.index
+    return [(ts.to_pydatetime(), float(o), float(hi), float(lo), float(c))
+            for ts, o, hi, lo, c in zip(idx, h["Open"], h["High"], h["Low"], h["Close"])
+            if c == c]
+
+
 def fetch_macro(period: str = "1y") -> pd.DataFrame:
     """Daily closes for each catalyst series, columns named by MACRO_TICKERS keys."""
     out = {}
@@ -419,7 +432,8 @@ class MemoryStore:
 
     def __init__(self):
         self.journal_keys = {"broker_fills": ("fill_id",), "broker_orders": ("order_no", "date"),
-                             "pnl_daily": ("date",), "trade_journal": ("strategy_id",)}
+                             "pnl_daily": ("date",), "trade_journal": ("strategy_id",),
+                             "ai_reviews": ("review_id",)}
         self._docs: dict[str, dict[tuple, dict]] = {n: {} for n in self.journal_keys}
         self._ohlcv: dict[tuple[str, str], pd.DataFrame] = {}
         self._fii = pd.DataFrame()

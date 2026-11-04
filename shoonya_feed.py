@@ -17,8 +17,8 @@ Shoonya integration (github.com/marketcalls/openalgo, broker/shoonya):
    "source":"API","accesstoken"} -> "ak"; touchline subscribe {"t":"t","k":"NSE|26000#..."};
    heartbeat {"t":"h"} every 30 s.
 
-Only GenAcsTok, SearchScrip, GetOptionChain and the touchline websocket are
-used — never an order route.  The password and TOTP are typed on Shoonya's
+Only GenAcsTok, SearchScrip, GetOptionChain, TPSeries (intraday candles), the
+read-only account books and the touchline websocket are used — never an order route.  The password and TOTP are typed on Shoonya's
 own site, so this app never sees them.  User ID, client ID and secret (and the
 day's access token) are kept in ~/.nse_analytics/shoonya.json, owner-only,
 outside the repo.
@@ -294,6 +294,28 @@ class ShoonyaFeed:
     def limits(self) -> dict:
         r = self._post("Limits", {"actid": self.uid})
         return r if r.get("stat") == "Ok" else {}
+
+    def time_series(self, key: str, start: float, end: float | None = None, interval: int = 1) -> list[tuple]:
+        """Intraday candles (TPSeries) for "EXCH|token" between epoch seconds, oldest
+        first, as (datetime IST-naive, open, high, low, close)."""
+        exch, token = key.split("|", 1)
+        r = self._post("TPSeries", {"exch": exch, "token": token, "st": str(int(start)),
+                                    "et": str(int(end or time.time())), "intrv": str(interval)})
+        if r.get("stat") != "Ok":
+            emsg = str(r.get("emsg", ""))
+            if "no data" in emsg.lower():
+                return []
+            raise RuntimeError(f"TPSeries: {emsg or r}")
+        out = []
+        for c in r.get("values") or []:
+            if c.get("stat") not in (None, "Ok"):
+                continue
+            try:
+                ts = datetime.strptime(c["time"], "%d-%m-%Y %H:%M:%S")
+                out.append((ts, float(c["into"]), float(c["inth"]), float(c["intl"]), float(c["intc"])))
+            except (KeyError, ValueError, TypeError):
+                continue
+        return sorted(out)
 
     def watch(self, keys) -> None:
         """Subscribe extra instruments (e.g. open-position legs) for live prices."""
