@@ -272,6 +272,33 @@ class ShoonyaFeed:
             raise RuntimeError(f"{route}: HTTP {r.status_code} {r.text[:120]!r}")
         return j
 
+    # ------------------------------------------------------------ account (read-only)
+    def _book(self, route: str) -> list[dict]:
+        r = self._post(route, {"actid": self.uid})
+        if r.get("stat") == "Ok":
+            return r.get("values") or []
+        emsg = str(r.get("emsg", ""))
+        if "no data" in emsg.lower():
+            return []
+        raise RuntimeError(f"{route}: {emsg or r}")
+
+    def position_book(self) -> list[dict]:
+        return self._book("PositionBook")
+
+    def order_book(self) -> list[dict]:
+        return self._book("OrderBook")
+
+    def trade_book(self) -> list[dict]:
+        return self._book("TradeBook")
+
+    def limits(self) -> dict:
+        r = self._post("Limits", {"actid": self.uid})
+        return r if r.get("stat") == "Ok" else {}
+
+    def watch(self, keys) -> None:
+        """Subscribe extra instruments (e.g. open-position legs) for live prices."""
+        self._subscribe({k for k in keys if k and "|" in k})
+
     @staticmethod
     def _json(r) -> dict | None:
         try:
@@ -412,7 +439,9 @@ class ShoonyaFeed:
             n += 1
         vt = self.tick(VIX_TOKEN)
         if self._fresh(vt):
-            out["vix"] = {"last": _f(vt["lp"]), "pct": _f(vt.get("pc"))}
+            lp, prev = _f(vt["lp"]), _f(vt.get("c"))
+            out["vix"] = {"last": lp, "prev": prev, "change": lp - prev if prev else None,
+                          "pct": (lp / prev - 1) * 100 if prev else _f(vt.get("pc"))}
         out["quotes"] = quotes
         out["source"] = f"Shoonya real-time · {n} instruments"
         return out

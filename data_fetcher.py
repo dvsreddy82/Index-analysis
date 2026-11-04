@@ -215,7 +215,8 @@ class NSEClient:
                     }
             vix = by_name.get("INDIA VIX")
             if vix:
-                out["vix"] = {"last": _num(vix.get("last")), "pct": _num(vix.get("percentChange"))}
+                out["vix"] = {"last": _num(vix.get("last")), "change": _num(vix.get("variation")),
+                              "pct": _num(vix.get("percentChange")), "prev": _num(vix.get("previousClose"))}
             out["breadth"] = {"adv": _num(j.get("advances")), "dec": _num(j.get("declines")),
                               "unch": _num(j.get("unchanged"))}
         r = self.get(f"{self.BASE}/api/etf")
@@ -417,10 +418,39 @@ class MemoryStore:
     still works (data just isn't persisted between runs)."""
 
     def __init__(self):
+        self.journal_keys = {"broker_fills": ("fill_id",), "broker_orders": ("order_no", "date"),
+                             "pnl_daily": ("date",), "trade_journal": ("strategy_id",)}
+        self._docs: dict[str, dict[tuple, dict]] = {n: {} for n in self.journal_keys}
         self._ohlcv: dict[tuple[str, str], pd.DataFrame] = {}
         self._fii = pd.DataFrame()
         self._macro = pd.DataFrame()
         self._sr: dict[tuple[str, str], dict] = {}
+
+    def upsert_docs(self, name, docs, insert_only=()):
+        coll = self._docs[name]
+        for d in docs:
+            key = tuple(d[k] for k in self.journal_keys[name])
+            cur = coll.get(key)
+            new = dict(d)
+            if cur is not None:
+                for k in insert_only:
+                    if k in cur:
+                        new[k] = cur[k]
+                cur.update(new)
+            else:
+                coll[key] = new
+        return len(docs)
+
+    def find_docs(self, name, query=None, sort=None):
+        rows = [dict(d) for d in self._docs[name].values()
+                if all(d.get(k) == v for k, v in (query or {}).items() if not isinstance(v, dict))]
+        return sorted(rows, key=lambda d: d.get(sort)) if sort else rows
+
+    def delete_docs(self, name, query):
+        keys = [k for k, d in self._docs[name].items() if all(d.get(a) == b for a, b in query.items())]
+        for k in keys:
+            del self._docs[name][k]
+        return len(keys)
 
     def upsert_ohlcv(self, symbol, timeframe, df):
         old = self._ohlcv.get((symbol, timeframe), pd.DataFrame())
@@ -672,7 +702,6 @@ class DataService:
 
 
 if __name__ == "__main__":
-    import json
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     svc = DataService()
     print("Persistent store:", svc.persistent)

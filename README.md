@@ -321,6 +321,33 @@ What you get once connected:
 
 **No orders:** the client is read-only. It never calls an order route.
 
+### Trades & P&L tab (positions, orders, journal, "why I lost")
+
+The tab reads your Shoonya account through read-only calls (PositionBook, OrderBook, TradeBook, Limits). While connected, it syncs every 30 seconds on this tab and about every 2 minutes elsewhere. Everything is stored in MongoDB, so the history builds up for later analysis.
+
+* **Open positions:** live legs grouped by underlying and expiry, with leg and strategy P&L, matching Shoonya's MTM. The management-plan checks flag:
+  * **BOOK** at ~50% of the credit captured.
+  * **EXIT** at a loss of 1.5× credit, or when spot moves through the outermost short strike.
+  * **WATCH** within 0.25σ of that strike, or one day before expiry.
+* **Orders (today) and Fills:** Shoonya's order book (with rejection reasons) and every stored fill.
+* **Market context on each fill:** every new fill is stamped with the Options-tab market read at that moment (IV vs realised vol, environment score, VIX, trend/ADX, OI walls, events). Imported fills get a context reconstructed from daily data instead, which has no option IV.
+* **Trade history:**
+  * **Grouping:** legs of the same underlying and expiry opened on the same day form one strategy. The structure is named (iron condor, iron butterfly, strangle, credit spread…), with "+ adjustments" when there are extra legs.
+  * **Matching:** fills are FIFO-matched into round trips. Options held to expiry are settled at intrinsic value from the index close.
+  * **Net P&L:** shown after estimated statutory charges, which are set in `config.CHARGES`.
+  * **Details:** double-click a strategy for its legs, the market at entry, what went against the plan, and your journal entry.
+* **Performance:** equity curve, daily P&L, win rate, payoff ratio, break-even win rate, expectancy, profit factor, drawdown, losing streak. P&L is broken down by structure, underlying, DTE at entry, selling environment at entry, IV vs realised vol, risk type, held-to-expiry, weekday and entry time.
+* **Why I lost:** rule-based findings ranked by rupees lost, each with a comparison to your other trades and a fix. The rules cover:
+  * selling in an unfavourable environment or into cheap IV;
+  * strikes inside 0.75σ, entries under 5 DTE, and entries in the first 15 minutes;
+  * events, neutral structures in trends, and spreads against the directional read;
+  * losses past 2× credit, undefined risk, and holding to expiry;
+  * revenge trades, overtrading, and single losses above 2% of capital;
+  * small wins with big losses, winners booked too early, and charges eating profits.
+* **Journal:** tags (no stop, FOMO, revenge, oversized…), a rating and notes per strategy, plus P&L by tag.
+* **Carried-forward positions:** Shoonya only lists today's trades. A position carried from an earlier session is recorded once at Shoonya's average price, marked "carry-forward" because its real entry date is unknown, so it reaches the history when you close it. Use **Import CSV…** for older trades from a broker export (date, symbol, buy/sell, qty, price).
+* **Settings:** `TRADING_CAPITAL` (0 = use Shoonya's cash limit) and `TRADES_SYNC_SECONDS` are in `config.py`.
+
 ### Options tab (NIFTY / BANKNIFTY option selling)
 
 Reads NSE's live option chain (`api/option-chain-v3`) and screens **positional** premium-selling structures: an iron condor, a short strangle, and a bull-put or bear-call spread when the directional read is one-sided. It is a screening tool, not advice. Every probability is a model estimate.

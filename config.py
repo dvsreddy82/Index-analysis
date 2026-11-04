@@ -143,6 +143,16 @@ LIVE_REFRESH_SECONDS: int = _env("LIVE_REFRESH_SECONDS", 15)  # live dashboard p
 NIFTY_LOT: int = _env("NIFTY_LOT", 65)            # F&O lot sizes — NSE revises these periodically
 BANKNIFTY_LOT: int = _env("BANKNIFTY_LOT", 30)
 OPTIONS_REFRESH_SECONDS: int = _env("OPTIONS_REFRESH_SECONDS", 60)
+TRADES_SYNC_SECONDS: int = _env("TRADES_SYNC_SECONDS", 30)     # Trades tab: broker book refresh
+TRADING_CAPITAL: float = _env("TRADING_CAPITAL", 0.0)          # 0 = use Shoonya's cash limit
+BROKERAGE_PER_ORDER: float = _env("BROKERAGE_PER_ORDER", 0.0)  # Shoonya: zero brokerage
+# Statutory charges (fractions of premium / turnover) used to estimate net P&L.
+# NSE / SEBI revise these; update here if they change.
+CHARGES = {
+    "option": {"stt_sell": 0.001, "stt_buy": 0.0, "exchange": 0.0003503, "stamp_buy": 0.00003},
+    "future": {"stt_sell": 0.0002, "stt_buy": 0.0, "exchange": 0.0000173, "stamp_buy": 0.00002},
+    "equity": {"stt_sell": 0.001, "stt_buy": 0.001, "exchange": 0.0000297, "stamp_buy": 0.00015},
+}
 
 
 def pair_of(symbol: str) -> str | None:

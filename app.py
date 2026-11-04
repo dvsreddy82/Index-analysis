@@ -16,8 +16,9 @@ from __future__ import annotations
 import html
 import logging
 import sys
+import time
 import traceback
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -42,6 +43,8 @@ from options_view import OptionsDashboard, ShoonyaDialog, ShoonyaWaitDialog
 from shoonya_feed import (INDEX_TOKENS, REDIRECT_URL, VIX_TOKEN, OAuthCatcher, ShoonyaFeed, from_env,
                           load_settings, save_settings)
 from data_fetcher import pick_expiry
+import trades_engine as te
+from trades_view import TradesDashboard
 
 log = logging.getLogger("app")
 
@@ -332,6 +335,23 @@ class MainWindow(QMainWindow):
         self.opts.broker_requested.connect(self.connect_shoonya)
         self.live.broker_requested.connect(self.connect_shoonya)
         self.tabs.addTab(self.opts, "Options — NIFTY / BANKNIFTY")
+        self.trades = TradesDashboard()
+        self.trades.sync_requested.connect(lambda: self.sync_trades(pull=True))
+        self.trades.recompute_requested.connect(lambda: self.sync_trades(pull=False))
+        self.trades.import_requested.connect(self.import_trades)
+        self.trades.journal_saved.connect(self.save_journal)
+        self.trades.connect_requested.connect(self.connect_shoonya)
+        self.tabs.addTab(self.trades, "Trades & P&L")
+        self._opt_ctx: dict[str, tuple[float, dict]] = {}
+        self._trades_busy = False
+        self._trades_pending: bool | None = None
+        self._last_book: dict = {}
+        self._ctx_cache: dict[str, dict] = {}
+        self.trades_timer = QTimer(self)
+        self.trades_timer.setInterval(config.TRADES_SYNC_SECONDS * 1000)
+        self.trades_timer.timeout.connect(self._trades_tick)
+        self.trades_timer.start()
+        self._trades_ticks = 0
         self._opt_busy = False
         self._opt_engine: dict[str, tuple[float, dict, pd.DataFrame]] = {}   # underlying -> (ts, analysis, daily)
         self.opt_timer = QTimer(self)
@@ -375,7 +395,7 @@ class MainWindow(QMainWindow):
     def _tab_changed(self, idx: int):
         page = self.tabs.widget(idx)
         self.panel.setVisible(page is self.web)
-        self.sidebar.setVisible(page is not self.live and page is not self.opts)
+        self.sidebar.setVisible(page not in (self.live, self.opts, self.trades))
         if page is self.web:
             # Sidebar ~15%, signal panel ~26% (min 340px), chart gets the rest.
             w = self.split.width()
@@ -385,6 +405,8 @@ class MainWindow(QMainWindow):
             self.poll_live()
         if page is self.opts and self.opts.res is None:
             self.opts.request()
+        if page is self.trades and not self.trades.data:
+            self.sync_trades(pull=self.shoonya.live)
 
     # ---------------------------------------------------------- options
     def load_options(self, underlying: str, expiry: str):
@@ -392,62 +414,61 @@ class MainWindow(QMainWindow):
             self._opt_pending = (underlying, expiry)    # run the latest request once this one returns
             return
         self._opt_busy, self._opt_pending = True, None
-        svc, cache = self.svc, self._opt_engine
-
-        feed, exp_cache = self.shoonya, self._opt_expiries
-
-        def job(progress):
-            import time
-            js = note = None
-            source = "nse"
-            if feed.live:
-                try:
-                    hit_e = exp_cache.get(underlying)
-                    if hit_e is None or time.time() - hit_e[0] > 3600:
-                        hit_e = exp_cache[underlying] = (time.time(), svc.option_expiries(underlying))
-                    expiries = hit_e[1]
-                    exp = pick_expiry(expiries, expiry or None)
-                    spot_key = INDEX_TOKENS["^NSEI" if underlying == "NIFTY" else "NIFTY BANK"]
-                    spot = float((feed.tick(spot_key) or {}).get("lp") or 0)
-                    if not spot:
-                        raise RuntimeError("no live index tick yet")
-                    first = (underlying, exp) not in feed.chains
-                    feed.ensure_chain(underlying, exp, spot, 50 if underlying == "NIFTY" else 100)
-                    for _ in range(30 if first else 0):           # let the first ticks arrive
-                        if feed.chain_json(underlying, exp, expiries)[1] > 0.8 * len(feed.chains[(underlying, exp)]):
-                            break
-                        time.sleep(0.1)
-                    js, live_legs = feed.chain_json(underlying, exp, expiries)
-                    if live_legs == 0:
-                        raise RuntimeError("no live option ticks")
-                    source = "shoonya"
-                except Exception as exc:
-                    log.warning("Shoonya option chain failed, using NSE: %s", exc)
-                    js, note = None, f"Shoonya unavailable: {exc}"
-            if js is None:
-                js, exp, _ = svc.option_chain(underlying, expiry or None)
-            hit = cache.get(underlying)
-            if hit is None or time.time() - hit[0] > 600:      # the EOD engine read changes slowly
-                sym = UNDERLYINGS[underlying]["daily"]
-                daily = svc.load_ohlcv(sym, "1D")
-                engine = analyze(sym, "1D", daily, daily, svc.load_fii_dii(), svc.load_macro()) if len(daily) > 60 else {}
-                hit = cache[underlying] = (time.time(), engine, daily)
-            macro = svc.load_macro()
-            vix = macro["indiavix"].dropna() if "indiavix" in macro else None
-            vt = feed.tick(VIX_TOKEN) if feed.live else None
-            if vix is not None and vt and vt.get("lp"):
-                vix = pd.concat([vix, pd.Series([float(vt["lp"])], index=[pd.Timestamp.now().normalize()])])
-            res = analyze_chain(underlying, js, exp, hit[2], vix, hit[1])
-            res["source"], res["source_note"] = source, note
-            return res
-
-        task = Task(job)
+        task = Task(lambda progress: self._options_analysis(underlying, expiry))
         task.signals.done.connect(self._options_done)
         task.signals.failed.connect(self._options_failed)
         self._start(task)
 
+    def _options_analysis(self, underlying: str, expiry: str | None) -> dict:
+        """Option-chain analysis (Shoonya live chain, else NSE). Runs on a worker thread."""
+        import time
+        svc, cache, feed, exp_cache = self.svc, self._opt_engine, self.shoonya, self._opt_expiries
+        js = note = None
+        source = "nse"
+        if feed.live:
+            try:
+                hit_e = exp_cache.get(underlying)
+                if hit_e is None or time.time() - hit_e[0] > 3600:
+                    hit_e = exp_cache[underlying] = (time.time(), svc.option_expiries(underlying))
+                expiries = hit_e[1]
+                exp = pick_expiry(expiries, expiry or None)
+                spot_key = INDEX_TOKENS["^NSEI" if underlying == "NIFTY" else "NIFTY BANK"]
+                spot = float((feed.tick(spot_key) or {}).get("lp") or 0)
+                if not spot:
+                    raise RuntimeError("no live index tick yet")
+                first = (underlying, exp) not in feed.chains
+                feed.ensure_chain(underlying, exp, spot, 50 if underlying == "NIFTY" else 100)
+                for _ in range(30 if first else 0):           # let the first ticks arrive
+                    if feed.chain_json(underlying, exp, expiries)[1] > 0.8 * len(feed.chains[(underlying, exp)]):
+                        break
+                    time.sleep(0.1)
+                js, live_legs = feed.chain_json(underlying, exp, expiries)
+                if live_legs == 0:
+                    raise RuntimeError("no live option ticks")
+                source = "shoonya"
+            except Exception as exc:
+                log.warning("Shoonya option chain failed, using NSE: %s", exc)
+                js, note = None, f"Shoonya unavailable: {exc}"
+        if js is None:
+            js, exp, _ = svc.option_chain(underlying, expiry or None)
+        hit = cache.get(underlying)
+        if hit is None or time.time() - hit[0] > 600:      # the EOD engine read changes slowly
+            sym = UNDERLYINGS[underlying]["daily"]
+            daily = svc.load_ohlcv(sym, "1D")
+            engine = analyze(sym, "1D", daily, daily, svc.load_fii_dii(), svc.load_macro()) if len(daily) > 60 else {}
+            hit = cache[underlying] = (time.time(), engine, daily)
+        macro = svc.load_macro()
+        vix = macro["indiavix"].dropna() if "indiavix" in macro else None
+        vt = feed.tick(VIX_TOKEN) if feed.live else None
+        if vix is not None and vt and vt.get("lp"):
+            vix = pd.concat([vix, pd.Series([float(vt["lp"])], index=[pd.Timestamp.now().normalize()])])
+        res = analyze_chain(underlying, js, exp, hit[2], vix, hit[1])
+        res["source"], res["source_note"] = source, note
+        return res
+
     def _options_done(self, res: dict):
         self._opt_busy = False
+        self._opt_ctx[res["underlying"]] = (time.time(), res)      # stamped on new fills (Trades tab)
         self.opts.set_result(res)
         self._options_next()
 
@@ -488,6 +509,211 @@ class MainWindow(QMainWindow):
         if self.shoonya.live and self._last_snap and self.tabs.currentWidget() is self.live:
             self._show_snapshot()
         self._broker_label()
+
+    # ---------------------------------------------------------- trades & P&L
+    SETTLE_SYMBOL = {"NIFTY": "^NSEI", "BANKNIFTY": "NIFTY BANK", "FINNIFTY": "NIFTY FINANCIAL SERVICES",
+                     "MIDCPNIFTY": "NIFTY MIDCAP SELECT"}
+
+    def _trades_tick(self):
+        """Pull broker books while connected: every tick on the Trades tab, every
+        4th tick (~2 min) elsewhere so fills are stamped with context promptly."""
+        self._trades_ticks += 1
+        if not (self.shoonya.live and self.trades.auto.isChecked()):
+            return
+        if self.tabs.currentWidget() is self.trades or self._trades_ticks % 4 == 0:
+            self.sync_trades(pull=True)
+
+    def sync_trades(self, pull: bool):
+        if self._trades_busy:
+            self._trades_pending = bool(self._trades_pending) or pull
+            return
+        self._trades_busy, self._trades_pending = True, None
+        days = self.trades.period_days()
+        task = Task(lambda progress: self._trades_job(pull and self.shoonya.live, days))
+        task.signals.done.connect(self._trades_done)
+        task.signals.failed.connect(self._trades_failed)
+        self._start(task)
+
+    def _fill_ctx(self, f: dict) -> dict:
+        """Market read to stamp on a newly seen fill: the latest Options-tab
+        analysis for its underlying (computed now if older than 15 min)."""
+        und = f["und"]
+        if und not in UNDERLYINGS:
+            return {}
+        hit = self._opt_ctx.get(und)
+        if hit is None or time.time() - hit[0] > 900:
+            exp = pd.Timestamp(f["expiry"]).strftime("%d-%b-%Y") if f.get("expiry") is not None else None
+            try:
+                hit = self._opt_ctx[und] = (time.time(), self._options_analysis(und, exp))
+            except Exception as exc:
+                log.warning("Could not analyse %s for fill context: %s", und, exc)
+                return {}
+        return te.ctx_from_analysis(hit[1])
+
+    def _trades_job(self, pull: bool, days) -> dict:
+        svc, feed, store = self.svc, self.shoonya, self.svc.store
+        status = []
+        if pull:
+            tb, ob, pb, lim = feed.trade_book(), feed.order_book(), feed.position_book(), feed.limits()
+            fills = [f for f in (te.fill_from_shoonya(r) for r in tb) if f]
+            known = {d["fill_id"] for d in store.find_docs("broker_fills")}
+            for f in fills:
+                if f["fill_id"] not in known:
+                    f["ctx"] = self._fill_ctx(f)
+            store.upsert_docs("broker_fills", fills, insert_only=("ctx",))
+            today = datetime.combine(date.today(), datetime.min.time(), tzinfo=timezone.utc)
+            store.upsert_docs("broker_orders", [{**o, "order_no": str(o.get("norenordno", "")), "date": today}
+                                                for o in ob if o.get("norenordno")])
+            lim_d = self._limits(lim)
+            store.upsert_docs("pnl_daily", [{"date": today, "realised": sum(_num(r.get("rpnl")) for r in pb),
+                                             "mtm": sum(_num(r.get("urmtom")) for r in pb), **lim_d}])
+            feed.watch(f"{r.get('exch')}|{r.get('token')}" for r in pb)
+            self._last_book = {"positions": pb, "orders": ob, "limits": lim_d, "at": datetime.now()}
+            status.append(f"Synced with Shoonya at {datetime.now():%H:%M:%S} · {len(fills)} fills, "
+                          f"{len(ob)} orders, {len(pb)} positions today")
+        elif self._last_book:
+            status.append(f"Last Shoonya sync {self._last_book['at']:%H:%M:%S}")
+        else:
+            status.append("Showing stored trades — connect Shoonya to pull today's book")
+
+        if pull:
+            self._carry_forward(store, pb)
+        all_fills = store.find_docs("broker_fills", sort="time")
+        macro = svc.load_macro()
+        vix = macro["indiavix"] if "indiavix" in macro else None
+        dailies: dict[str, pd.DataFrame] = {}
+
+        def daily(und):
+            sym = self.SETTLE_SYMBOL.get(und)
+            if sym and sym not in dailies:
+                dailies[sym] = svc.load_ohlcv(sym, "1D")
+            return dailies.get(sym)
+
+        for f in all_fills:                                  # older / imported fills: reconstruct context
+            if not f.get("ctx"):
+                if f["fill_id"] not in self._ctx_cache:
+                    self._ctx_cache[f["fill_id"]] = te.reconstruct_ctx(f["und"], f["time"], daily(f["und"]), vix,
+                                                                         f.get("expiry"))
+                f["ctx"] = self._ctx_cache[f["fill_id"]]
+
+        def settle(und, d):
+            df = daily(und)
+            if df is None or df.empty:
+                return None
+            idx = df.index.tz_convert(config.IST).date if df.index.tz is not None else df.index.date
+            hit = df["close"][idx <= d]          # expiry close (or the last session before a holiday)
+            if not len(hit) or (d - idx[idx <= d][-1]).days > 4:
+                return None
+            return float(hit.iloc[-1])
+
+        closed, open_legs = te.round_trips(all_fills, settle)
+        strats = te.strategies(closed, open_legs)
+        if days is not None:
+            now = pd.Timestamp.now(tz=config.IST)
+            cut = (now.normalize() if days == 0 else
+                   pd.Timestamp(now.year, 1, 1, tz=config.IST) if days == -1 else now - pd.Timedelta(days=days))
+            strats = [s for s in strats if s["status"] == "open" or (s["exit_time"] or s["entry_time"]) >= cut]
+            fills_shown = [f for f in all_fills if pd.Timestamp(f["time"]).tz_convert(config.IST) >= cut]
+        else:
+            fills_shown = all_fills
+        book = self._last_book
+        lim = book.get("limits") or {}
+        capital = config.TRADING_CAPITAL or lim.get("available_total") or None
+        spot, sigma = {}, {}
+        for und in ("NIFTY", "BANKNIFTY"):
+            t = feed.tick(INDEX_TOKENS["^NSEI" if und == "NIFTY" else "NIFTY BANK"]) if feed.live else None
+            if t and t.get("lp"):
+                spot[und] = float(t["lp"])
+            elif und in self._opt_ctx:
+                spot[und] = self._opt_ctx[und][1].get("spot")
+            if und in self._opt_ctx:
+                sigma[und] = self._opt_ctx[und][1].get("sigma_move")
+        positions = te.manage_positions(book.get("positions") or [], spot, sigma)
+        orders = book.get("orders")
+        if orders is None:
+            today = datetime.combine(date.today(), datetime.min.time(), tzinfo=timezone.utc)
+            orders = [o for o in store.find_docs("broker_orders") if pd.Timestamp(o.get("date")) == pd.Timestamp(today)]
+        return {
+            "status": " · ".join(status), "positions": positions, "orders": orders,
+            "fills": list(reversed(fills_shown)), "strategies": strats, "metrics": te.metrics(strats),
+            "breakdowns": te.breakdowns(strats), "findings": te.diagnose(strats, capital),
+            "equity": te.equity_curve(strats), "limits": lim,
+            "today": {"open": sum(g["open_pnl"] for g in positions), "total": sum(g["mtm"] for g in positions)},
+            "journal": {d["strategy_id"]: d for d in store.find_docs("trade_journal")},
+            "explain": te._RULES,
+        }
+
+    @staticmethod
+    def _carry_forward(store, pb: list[dict]):
+        """Positions carried from earlier sessions have no fills in today's
+        TradeBook.  Record a 'carry-forward' opening fill at Shoonya's average
+        price for any carried quantity the stored fills don't explain, so the
+        position shows up in trade history when it is closed."""
+        start = pd.Timestamp.now(tz=config.IST).normalize()
+        stored = store.find_docs("broker_fills")
+        new = []
+        for r in pb:
+            cf = int(_num(r.get("cfbuyqty"))) - int(_num(r.get("cfsellqty")))
+            if not cf:
+                continue
+            tsym = r.get("tsym", "")
+            before = sum((f["qty"] if f["side"] == "B" else -f["qty"]) for f in stored
+                         if f["tsym"] == tsym and pd.Timestamp(f["time"]).tz_convert(config.IST) < start)
+            diff = cf - before
+            if not diff:
+                continue
+            side = "B" if diff > 0 else "S"
+            px = _num(r.get("cfbuyavgprc") if side == "B" else r.get("cfsellavgprc")) or _num(r.get("netavgprc"))
+            new.append({"fill_id": f"cf-{tsym}-{start.date()}", "order_no": "", "tsym": tsym,
+                        "time": (start + pd.Timedelta(hours=9)).to_pydatetime(), "exch": r.get("exch", ""),
+                        "token": str(r.get("token", "")), "side": side, "qty": abs(diff), "price": px,
+                        "lot": int(_num(r.get("ls")) or 1), "product": r.get("prd", ""), "source": "carry-forward",
+                        "ctx": {"source": "carry-forward", "first_seen": str(start.date())},
+                        **te._parsed(tsym)})
+        if new:
+            store.upsert_docs("broker_fills", new, insert_only=("ctx",))
+
+    @staticmethod
+    def _limits(lim: dict) -> dict:
+        """Shoonya Limits -> margin used / available (approximate: cash + pay-in +
+        collateral − margin used)."""
+        if not lim:
+            return {}
+        used = _num(lim.get("marginused"))
+        total = sum(_num(lim.get(k)) for k in ("cash", "payin", "brkcollamt", "collateral", "unclearedcash"))
+        return {"margin_used": used, "available_total": total, "available": total - used,
+                "cash": _num(lim.get("cash")), "premium": _num(lim.get("premium"))}
+
+    def _trades_done(self, d: dict):
+        self._trades_busy = False
+        self.trades.set_data(d)
+        self._trades_next()
+
+    def _trades_failed(self, err: str):
+        self._trades_busy = False
+        self.trades.set_status(f"<span style='color:{C['down']}'>Trades sync failed: "
+                               f"{html.escape(err.splitlines()[0] if err else '')}</span>")
+        self._trades_next()
+
+    def _trades_next(self):
+        if self._trades_pending is not None:
+            pull = self._trades_pending
+            self._trades_pending = None
+            self.sync_trades(pull)
+
+    def import_trades(self, path: str):
+        try:
+            fills = te.fills_from_csv(pd.read_csv(path))
+        except Exception as exc:
+            QMessageBox.warning(self, "Import failed", str(exc))
+            return
+        n = self.svc.store.upsert_docs("broker_fills", fills, insert_only=("ctx",))
+        self.trades.set_status(f"Imported {len(fills)} fills ({n} new or updated) from {html.escape(path)}")
+        self.sync_trades(pull=False)
+
+    def save_journal(self, doc: dict):
+        self.svc.store.upsert_docs("trade_journal", [doc])
+        self.sync_trades(pull=False)
 
     # ---------------------------------------------------------- Shoonya
     def connect_shoonya(self):
@@ -556,6 +782,7 @@ class MainWindow(QMainWindow):
         self._broker_label()
         if self.tabs.currentWidget() is self.opts:
             self.opts.request()
+        self.sync_trades(pull=True)
 
     def _shoonya_failed(self, err: str, retry_settings: dict | None = None):
         self.broker_btn.setEnabled(True)
@@ -584,6 +811,8 @@ class MainWindow(QMainWindow):
             b.setEnabled(self.broker_btn.isEnabled())
         self.opts.broker.setText(head)
         self.live.broker.setText(head)
+        self.trades.connect_btn.setText(head)
+        self.trades.connect_btn.setStyleSheet(style)
 
     def _live_failed(self, err: str):
         self._live_busy = False
@@ -1136,6 +1365,13 @@ class MainWindow(QMainWindow):
             it = QTableWidgetItem(v)
             it.setForeground(QColor(color if j == 0 else C["text"] if j < 4 else C["muted"]))
             self.table.setItem(i, j, it)
+
+
+def _num(v) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def main():

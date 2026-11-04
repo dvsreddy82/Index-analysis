@@ -131,6 +131,9 @@ class DBHandler:
         self.fii_dii: Collection = self.db["fii_dii_activity"]
         self.sr_levels: Collection = self.db["sr_levels"]
         self.macro: Collection = self.db["macro_series"]
+        # broker / trade journal (see trades_engine.py); key fields per collection
+        self.journal_keys = {"broker_fills": ("fill_id",), "broker_orders": ("order_no", "date"),
+                             "pnl_daily": ("date",), "trade_journal": ("strategy_id",)}
         self.ensure_schema()
 
     # ------------------------------------------------------------ setup
@@ -159,6 +162,9 @@ class DBHandler:
             unique=True, name="symbol_tf_date_unique")
         self.macro.create_index([("series", ASCENDING), ("date", ASCENDING)],
                                 unique=True, name="series_date_unique")
+        for name, keys in self.journal_keys.items():
+            self.db[name].create_index([(k, ASCENDING) for k in keys], unique=True, name="_".join(keys) + "_unique")
+        self.db["broker_fills"].create_index([("time", DESCENDING)], name="time")
 
     def close(self) -> None:
         self.client.close()
@@ -265,6 +271,50 @@ class DBHandler:
             return df
         df["date"] = pd.to_datetime(df["date"], utc=True).dt.tz_localize(None)
         return df.pivot_table(index="date", columns="series", values="close").sort_index()
+
+
+# ------------------------------------------------------------ broker / journal docs
+def _doc_clean(d):
+    if isinstance(d, dict):
+        return {k: _doc_clean(v) for k, v in d.items()}
+    if isinstance(d, (list, tuple)):
+        return [_doc_clean(v) for v in d]
+    if isinstance(d, pd.Timestamp):
+        return d.to_pydatetime()
+    return _clean(d)
+
+
+def _upsert_docs(self, name: str, docs: list[dict], insert_only: tuple[str, ...] = ()) -> int:
+    """Upsert by the collection's natural key; `insert_only` fields (e.g. the
+    market context stamped on a fill) are written the first time only."""
+    keys = self.journal_keys[name]
+    ops = []
+    for d in docs:
+        d = _doc_clean(d)
+        key = {k: d[k] for k in keys}
+        upd = {"$set": {k: v for k, v in d.items() if k not in key and k not in insert_only}}
+        ins = {k: d[k] for k in insert_only if k in d}
+        if ins:
+            upd["$setOnInsert"] = ins
+        upd["$set"]["updated_at"] = datetime.now(timezone.utc)
+        ops.append(UpdateOne(key, upd, upsert=True))
+    return self._bulk_upsert(self.db[name], ops)
+
+
+def _find_docs(self, name: str, query: dict | None = None, sort: str | None = None) -> list[dict]:
+    cur = self.db[name].find(query or {}, {"_id": 0})
+    if sort:
+        cur = cur.sort(sort, ASCENDING)
+    return list(cur)
+
+
+def _delete_docs(self, name: str, query: dict) -> int:
+    return self.db[name].delete_many(query).deleted_count
+
+
+DBHandler.upsert_docs = _upsert_docs
+DBHandler.find_docs = _find_docs
+DBHandler.delete_docs = _delete_docs
 
 
 if __name__ == "__main__":

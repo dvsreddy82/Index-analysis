@@ -76,6 +76,27 @@ def nearest_levels(ltp: float, doc: dict | None) -> tuple[float | None, float | 
     return (max(below) if below else None), (min(above) if above else None)
 
 
+def quote_change(q: dict | None) -> float | None:
+    """Point change vs previous close: the source's own figure, else derived from prev or pct."""
+    if not q or q.get("last") is None:
+        return None
+    if q.get("change") is not None:
+        return q["change"]
+    if q.get("prev"):
+        return q["last"] - q["prev"]
+    if q.get("pct") is not None:
+        return q["last"] - q["last"] / (1 + q["pct"] / 100)
+    return None
+
+
+def fmt_chg(q: dict | None, digits: int = 2) -> str:
+    """'+123.45 (+0.52%)' — point change and percent change together."""
+    ch, pct = quote_change(q), (q or {}).get("pct")
+    if pct is None:
+        return "—"
+    return (f"{ch:+,.{digits}f} " if ch is not None else "") + f"({pct:+.2f}%)"
+
+
 def fmt_px(v: float | None) -> str:
     if v is None:
         return "—"
@@ -270,7 +291,7 @@ class Tile(QFrame):
         last, pct = q["last"], q.get("pct") or 0
         col = C["up"] if pct >= 0 else C["down"]
         self.ltp.setText(fmt_px(last))
-        self.pct.setText(f"{pct:+.2f}%")
+        self.pct.setText(fmt_chg(q))
         self.pct.setStyleSheet(f"font-weight:700;font-size:12px;color:{col};background:transparent")
         self._style(pct)
         proj = (doc or {}).get("projection") or {}
@@ -290,7 +311,7 @@ class Tile(QFrame):
         if etf_sym and etf_q and etf_q.get("last") is not None:
             ep = etf_q.get("pct") or 0
             self.etf.setText(f"{etf_sym.removesuffix('.NS')} ₹{etf_q['last']:,.2f} "
-                             f"<span style='color:{C['up'] if ep >= 0 else C['down']}'>{ep:+.2f}%</span>")
+                             f"<span style='color:{C['up'] if ep >= 0 else C['down']}'>{fmt_chg(etf_q)}</span>")
         self.setToolTip(f"{config.INSTRUMENTS[self.symbol].name}\nOpen {fmt_px(q.get('open'))} · "
                         f"High {fmt_px(q.get('high'))} · Low {fmt_px(q.get('low'))} · Prev {fmt_px(q.get('prev'))}"
                         + (f"\n52w {fmt_px(q.get('year_low'))} – {fmt_px(q.get('year_high'))}"
@@ -490,11 +511,11 @@ class LiveDashboard(QWidget):
             x = q.get(sym)
             if x and x.get("last") is not None:
                 c = C["up"] if (x.get("pct") or 0) >= 0 else C["down"]
-                self.hdr[key].setText(f"{label} <b>{x['last']:,.2f}</b> <span style='color:{c}'>{x['pct']:+.2f}%</span>")
+                self.hdr[key].setText(f"{label} <b>{x['last']:,.2f}</b> <span style='color:{c}'>{fmt_chg(x)}</span>")
         v = snap.get("vix")
         if v and v.get("last") is not None:
             c = C["down"] if (v.get("pct") or 0) > 0 else C["up"]
-            self.hdr["vix"].setText(f"VIX <b>{v['last']:.2f}</b> <span style='color:{c}'>{v['pct']:+.2f}%</span>")
+            self.hdr["vix"].setText(f"VIX <b>{v['last']:.2f}</b> <span style='color:{c}'>{fmt_chg(v)}</span>")
         n500 = q.get("NIFTY 500") or {}
         if n500.get("adv") is not None:
             adv, dec = n500["adv"], n500["dec"]
