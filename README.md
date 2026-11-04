@@ -289,6 +289,30 @@ A practical routine:
 
 **Comparing across indices:** on breadth, if large caps are Range-bound while mid and small caps are Bearish, the large-cap ETFs (NIFTYBEES, JUNIORBEES, NIF100BEES, BANKBEES) are the safer dip-buys. Only rotate into mid or small caps once their regime flips out of Bearish, or they reclaim the 200 EMA.
 
+### Options tab (NIFTY / BANKNIFTY option selling)
+
+Reads NSE's live option chain (`api/option-chain-v3`) and screens **positional** premium-selling structures: an iron condor, a short strangle, and a bull-put or bear-call spread when the directional read is one-sided. It is a screening tool, not advice. Every probability is a model estimate.
+
+* **Default expiry:** the first one at least 7 days out. Below that, gamma dominates and the trade stops being positional. You can pick another expiry from the drop-down.
+* **Option-chain read:** ATM IV against 10/20-session realised vol, the 1σ expected move and ATM straddle, PCR (total and today's OI change), max pain, the three biggest call and put OI walls, put–call skew, India VIX percentile, and trend/ADX from the main engine.
+* **Selling environment:** a checklist covering IV rich or cheap versus realised vol, vol expansion, days to expiry, VIX regime, trend strength, the OI-wall band and events before expiry. It adds up to FAVOURABLE, MIXED or UNFAVOURABLE.
+* **Strike selection:**
+  * Short strikes sit near 0.16 delta, about 1σ out of the money (0.28 delta for one-sided spreads).
+  * Among strikes within ±0.03 delta of that target, the one with the most OI is chosen.
+  * A short strike is nudged beyond a nearby OI wall or S/R zone.
+  * Wings are about 0.5σ wide.
+  * Only strikes with OI, volume today, a two-sided quote and a spread of ≤10% are used.
+  * Sells are priced at the bid and buys at the ask.
+* **Per structure:**
+  * credit, max loss, breakevens;
+  * win probability at IV and at realised vol;
+  * **expectancy at realised vol**, the simulated average P&L if the index keeps moving like its last 20 sessions (positive means the premium is rich);
+  * theta and vega;
+  * average loss in the worst 5% of outcomes.
+  * Each comes with why it can work, what can go wrong, and a management plan: book profit at ~50% of credit, cut at ~1.5× credit or on a daily close through a short strike, close or roll 1–2 sessions before expiry.
+* **Badges:** a structure with negative expectancy is labelled **NEGATIVE EXPECTANCY — NO EDGE** whatever its win rate.
+* **Settings:** lot sizes (`NIFTY_LOT`, `BANKNIFTY_LOT`) and the refresh interval (`OPTIONS_REFRESH_SECONDS`) are in `config.py`. NSE revises lot sizes periodically.
+
 ### Using the decision card
 * Do your **monthly planning on the 1D timeframe**, because that is where the zones, projection and pivots apply. Use **1H or 15m only to time entries** inside a daily zone that is already flagged.
 * Check **NIFTY (`^NSEI`)** for the main market picture. The card's *NIFTYBEES equivalent* row converts the NIFTY range into NIFTYBEES prices using the live price ratio. Then switch to `NIFTYBEES.NS` for the exact prices to trade.

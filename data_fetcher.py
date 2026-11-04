@@ -179,6 +179,19 @@ class NSEClient:
             log.warning("Could not parse participant OI for %s: %s", day, exc)
             return None
 
+    # ---------------------------------------------------------- option chain
+    def option_expiries(self, symbol: str) -> list[str]:
+        r = self.get(f"{self.BASE}/api/option-chain-contract-info?symbol={symbol}")
+        return (r.json().get("expiryDates") or []) if r is not None else []
+
+    def option_chain(self, symbol: str, expiry: str) -> dict | None:
+        """Full option chain for one index expiry (expiry as 'DD-Mon-YYYY')."""
+        r = self.get(f"{self.BASE}/api/option-chain-v3?type=Indices&symbol={symbol}&expiry={expiry}")
+        if r is None:
+            return None
+        js = r.json()
+        return js if (js.get("records") or {}).get("data") else None
+
     # ---------------------------------------------------------- live quotes
     def live_snapshot(self) -> dict:
         """One-shot live quotes for every configured index and ETF (2 requests).
@@ -465,6 +478,7 @@ class DataService:
         self.nse = NSEClient()
         # Separate session so live polling never contends with a running sync.
         self.live_nse = NSEClient(timeout=8, retries=2)
+        self.oc_nse = NSEClient(timeout=15, retries=2)    # option chain, own session/thread
 
     # ---------------------------------------------------------- sync
     def sync(self, symbols=None, timeframes=None, oi_backfill_days: int = 135,   # ~90 sessions, matching the cash history
@@ -611,6 +625,21 @@ class DataService:
 
     def live_snapshot(self) -> dict:
         return self.live_nse.live_snapshot()
+
+    def option_chain(self, symbol: str, expiry: str | None = None) -> tuple[dict, str, list[str]]:
+        """(chain json, expiry used, all expiries).  With no expiry, picks the first
+        one at least 7 days out — the nearest that suits a positional seller."""
+        expiries = self.oc_nse.option_expiries(symbol)
+        if not expiries:
+            raise RuntimeError(f"NSE returned no expiries for {symbol}")
+        if expiry not in expiries:
+            today = date.today()
+            far = [e for e in expiries if (pd.to_datetime(e, format="%d-%b-%Y").date() - today).days >= 7]
+            expiry = far[0] if far else expiries[0]
+        js = self.oc_nse.option_chain(symbol, expiry)
+        if js is None:
+            raise RuntimeError(f"NSE option chain unavailable for {symbol} {expiry}")
+        return js, expiry, expiries
 
     def latest_levels(self, symbols=None) -> dict[str, dict]:
         """Most recent 1D sr_levels document per symbol (as saved by analyses/scans)."""

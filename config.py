@@ -119,6 +119,9 @@ EXECUTION_SYMBOL = "NIFTYBEES.NS"   # default instrument we trade
 REFERENCE_INDEX = "^NSEI"
 NSE_HISTORY_YEARS: int = _env("NSE_HISTORY_YEARS", 2)   # archive back-fill depth
 LIVE_REFRESH_SECONDS: int = _env("LIVE_REFRESH_SECONDS", 15)  # live dashboard poll interval
+NIFTY_LOT: int = _env("NIFTY_LOT", 65)            # F&O lot sizes — NSE revises these periodically
+BANKNIFTY_LOT: int = _env("BANKNIFTY_LOT", 30)
+OPTIONS_REFRESH_SECONDS: int = _env("OPTIONS_REFRESH_SECONDS", 60)
 
 
 def pair_of(symbol: str) -> str | None:

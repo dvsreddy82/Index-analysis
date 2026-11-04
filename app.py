@@ -36,6 +36,8 @@ import config
 from data_fetcher import DataService, import_fii_dii_csv
 from indicators import analyze, to_sr_document
 from live_view import CHART_DAYS, LiveDashboard
+from options import UNDERLYINGS, analyze_chain
+from options_view import OptionsDashboard
 
 log = logging.getLogger("app")
 
@@ -321,6 +323,15 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.live, "● Live — all indices")
         self.tabs.addTab(self.web, "Chart")
         self.tabs.addTab(self._build_scanner(), "Scanner")
+        self.opts = OptionsDashboard()
+        self.opts.refresh_requested.connect(self.load_options)
+        self.tabs.addTab(self.opts, "Options — NIFTY / BANKNIFTY")
+        self._opt_busy = False
+        self._opt_engine: dict[str, tuple[float, dict, pd.DataFrame]] = {}   # underlying -> (ts, analysis, daily)
+        self.opt_timer = QTimer(self)
+        self.opt_timer.setInterval(config.OPTIONS_REFRESH_SECONDS * 1000)
+        self.opt_timer.timeout.connect(lambda: self.tabs.currentWidget() is self.opts and self.opts.request())
+        self.opt_timer.start()
         self.tabs.currentChanged.connect(self._tab_changed)
         split.addWidget(self.tabs)
         self.panel = self._build_panel()
@@ -348,7 +359,7 @@ class MainWindow(QMainWindow):
     def _tab_changed(self, idx: int):
         page = self.tabs.widget(idx)
         self.panel.setVisible(page is self.web)
-        self.sidebar.setVisible(page is not self.live)
+        self.sidebar.setVisible(page is not self.live and page is not self.opts)
         if page is self.web:
             # Sidebar ~15%, signal panel ~26% (min 340px), chart gets the rest.
             w = self.split.width()
@@ -356,6 +367,48 @@ class MainWindow(QMainWindow):
             self.split.setSizes([side, max(w - side - panel, 300), panel])
         if self.tabs.widget(idx) is self.live:
             self.poll_live()
+        if page is self.opts and self.opts.res is None:
+            self.opts.request()
+
+    # ---------------------------------------------------------- options
+    def load_options(self, underlying: str, expiry: str):
+        if self._opt_busy:
+            self._opt_pending = (underlying, expiry)    # run the latest request once this one returns
+            return
+        self._opt_busy, self._opt_pending = True, None
+        svc, cache = self.svc, self._opt_engine
+
+        def job(progress):
+            import time
+            js, exp, _ = svc.option_chain(underlying, expiry or None)
+            hit = cache.get(underlying)
+            if hit is None or time.time() - hit[0] > 600:      # the EOD engine read changes slowly
+                sym = UNDERLYINGS[underlying]["daily"]
+                daily = svc.load_ohlcv(sym, "1D")
+                engine = analyze(sym, "1D", daily, daily, svc.load_fii_dii(), svc.load_macro()) if len(daily) > 60 else {}
+                hit = cache[underlying] = (time.time(), engine, daily)
+            macro = svc.load_macro()
+            vix = macro["indiavix"] if "indiavix" in macro else None
+            return analyze_chain(underlying, js, exp, hit[2], vix, hit[1])
+
+        task = Task(job)
+        task.signals.done.connect(self._options_done)
+        task.signals.failed.connect(self._options_failed)
+        self._start(task)
+
+    def _options_done(self, res: dict):
+        self._opt_busy = False
+        self.opts.set_result(res)
+        self._options_next()
+
+    def _options_failed(self, err: str):
+        self._opt_busy = False
+        self.opts.set_error(err.splitlines()[0] if err else "unknown error")
+        self._options_next()
+
+    def _options_next(self):
+        if getattr(self, "_opt_pending", None):
+            self.load_options(*self._opt_pending)
 
     def poll_live(self):
         """Fetch live quotes in the background; skipped while hidden or paused."""
