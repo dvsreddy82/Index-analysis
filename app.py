@@ -359,9 +359,10 @@ class MainWindow(QMainWindow):
         self.trades.import_requested.connect(self.import_trades)
         self.trades.journal_saved.connect(self.save_journal)
         self.trades.connect_requested.connect(self.connect_shoonya)
-        self.ai = AICoachPanel(lambda: self.trades.data, self.svc.store, lambda: self.trades.period.currentText())
-        self.trades.tabs.addTab(self.ai, "AI coach (local LLM)")
         self.tabs.addTab(self.trades, "Trades && P&&L")
+        self.ai = AICoachPanel(lambda: self.trades.data, self.svc.store, lambda: self.trades.period.currentText())
+        self.ai.data_needed.connect(lambda: self.sync_trades(pull=self.shoonya.live))
+        self.tabs.addTab(self.ai, "🤖 AI coach — chat about my trades")
         self._opt_ctx: dict[str, tuple[float, dict]] = {}
         self._trades_busy = False
         self._trades_pending: bool | None = None
@@ -415,7 +416,9 @@ class MainWindow(QMainWindow):
     def _tab_changed(self, idx: int):
         page = self.tabs.widget(idx)
         self.panel.setVisible(page is self.web)
-        self.sidebar.setVisible(page not in (self.live, self.opts, self.trades, self.rtc))
+        self.sidebar.setVisible(page not in (self.live, self.opts, self.trades, self.rtc, self.ai))
+        if page is self.ai and not self.trades.data:
+            self.sync_trades(pull=self.shoonya.live)
         if page is self.rtc:
             self.load_rt_chart()
             self._chart_option_levels()
@@ -804,6 +807,7 @@ class MainWindow(QMainWindow):
     def _trades_done(self, d: dict):
         self._trades_busy = False
         self.trades.set_data(d)
+        self.ai.data_ready()
         self.rtc.set_positions(d.get("positions") or [])         # my strikes on the chart
         self._trades_next()
 

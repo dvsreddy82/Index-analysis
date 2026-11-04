@@ -40,8 +40,12 @@ Rules:
 - If a pattern rests on fewer than ~5 trades, say the sample is thin and treat it as a hypothesis.
 - Focus on process the trader controls: entry selection (environment score, IV vs realised vol, DTE, events,
   trend vs structure), position sizing, defined vs undefined risk, adjustments, exits and discipline.
-- The trader's own management plan: book around 50% of credit, exit when the loss reaches 1.5x credit or when
-  spot moves through the outermost short strike, avoid holding short options into expiry-day gamma.
+- The trader's own management plan, applied to the WHOLE position: close it once the open profit reaches about 50% of
+  the credit received ("book at 50%" never means taking half the credit now); close it if the open loss reaches 1.5x
+  the credit or spot moves through the outermost short strike; avoid holding short options into expiry-day gamma.
+- "credit" is the net premium received in ₹ for the whole position (all lots); "open_pnl" is the live mark-to-market.
+- Read "data_notes" first. If live P&L or closed-trade history is missing, say so plainly and do not invent it or
+  treat placeholder fields as P&L.
   For open positions, compare each against this plan and lay out the options with their trade-offs;
   the decision is the trader's.
 - Do not predict market direction, do not promise profits, do not invent data.
@@ -137,18 +141,24 @@ def _ctx(c: dict) -> dict:
 
 def _strategy(s: dict, journal: dict | None) -> dict:
     flags = [label for _fid, label in te._flags(s)]
+    is_open = s["status"] == "open"
+    carried = (s.get("ctx") or {}).get("source") == "carry-forward"
     out = {
         "id": s["id"], "und": s["und"], "structure": s["structure"], "defined_risk": s["defined_risk"],
-        "status": s["status"], "opened": _t(s["entry_time"]), "closed": _t(s["exit_time"]),
+        "status": s["status"],
+        "opened": "carried forward from an earlier session (true entry date unknown)" if carried else _t(s["entry_time"]),
+        "closed": _t(s["exit_time"]),
         "expiry": _t(s["expiry"]), "dte_at_entry": s["dte_entry"], "lots": _r(s["lots"], 1),
-        "credit": _r(s["credit"]), "net_pnl": _r(s["net"]), "charges": _r(s["charges"]),
-        "pct_credit_kept": _r(s["captured"] * 100) if s["captured"] is not None else None,
+        "credit": _r(s["credit"]),
+        # an open strategy's P&L lives in open_positions (live prices); here it would only be estimated charges
+        "net_pnl": None if is_open else _r(s["net"]), "charges": _r(s["charges"]),
+        "pct_credit_kept": None if is_open or s["captured"] is None else _r(s["captured"] * 100),
         "loss_x_credit": _r(s["loss_x_credit"], 2) or None, "held_to_expiry": s["held_to_expiry"],
         "days_held": _r(s["holding_days"], 1),
         "legs": [f"{l['side']} {l['qty']} {l['kind']} {format(l['strike'], 'g') if l['strike'] is not None else ''} @ {_r(l['entry_px'], 2)}"
                  + (f" -> {_r(l['exit_px'], 2)} ({l['exit_reason']})" if l.get("exit_px") is not None else "")
                  for l in s["legs"]],
-        "market_at_entry": _ctx(s.get("ctx") or {}), "mistakes": flags,
+        "market_at_entry": {} if carried else _ctx(s.get("ctx") or {}), "mistakes": flags,
     }
     if journal:
         out["journal"] = {k: journal[k] for k in ("tags", "rating", "notes") if journal.get(k)}
@@ -179,7 +189,19 @@ def build_brief(d: dict, period: str = "") -> dict:
                   "alerts": [f"{kind.upper()}: {msg}" for kind, msg in g["alerts"]]}
                  for g in (d.get("positions") or [])]
     lim = d.get("limits") or {}
+    notes = []
+    if not closed:
+        notes.append("No closed trades in this period yet, so there is no win rate, expectancy or pattern history; "
+                     "metrics are empty. Base the review on the open positions and say more history is needed.")
+    elif len(closed) < 10:
+        notes.append(f"Only {len(closed)} closed strategies: treat every pattern as a hypothesis.")
+    if not positions:
+        notes.append("Live positions are not available (broker not connected or no open positions), so open P&L, "
+                     "% captured and spot vs strikes are unknown. Do not estimate them.")
+    if any(s["status"] == "open" for s in strats):
+        notes.append("open_strategies list the legs and credit of open positions; their P&L is only in open_positions.")
     return {
+        "data_notes": notes,
         "as_of": datetime.now().strftime("%Y-%m-%d %H:%M"), "period": period,
         "trader": {"style": "positional NIFTY/BANKNIFTY option seller, no scalping",
                    "lot_sizes": {"NIFTY": config.NIFTY_LOT, "BANKNIFTY": config.BANKNIFTY_LOT},

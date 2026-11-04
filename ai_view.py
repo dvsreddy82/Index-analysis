@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 import uuid
 from datetime import datetime
 
@@ -27,7 +28,26 @@ class _Bridge(QObject):
     status = Signal(bool, list, str)  # server up, models, message
 
 
+WELCOME = """### 🤖 AI coach — chat about your trades
+Runs **qwen3:14b locally** through Ollama — your trades never leave this Mac.
+
+**Start with a one-click review above**, or type a question below, for example:
+- *Why am I losing money on BANKNIFTY?*
+- *Should I be selling strangles or iron condors given my results?*
+- *Which of my habits cost me the most this month?*
+- *Review my open NIFTY position against my plan.*
+
+Follow-up questions continue the same conversation. **New chat** starts fresh with the latest numbers.
+The coach sees what the Trades & P&L tab computed for the selected period: metrics, breakdowns, the
+*Why I lost* findings, open positions and alerts, and your recent strategies with market context, mistakes and
+journal notes.
+
+*Automated review of your own data — not investment advice.*"""
+
+
 class AICoachPanel(QWidget):
+    data_needed = Signal()          # ask the app to load / sync trades
+
     def __init__(self, data_provider, store, period_provider=lambda: ""):
         super().__init__()
         self.setObjectName("root")
@@ -42,6 +62,9 @@ class AICoachPanel(QWidget):
         self.thread_msgs: list[dict] = []       # follow-up conversation for the current review
         self.brief: dict | None = None
         self.text, self.think_chars, self.current = "", 0, {}
+        self.chat: list[tuple[str, str]] = []    # (role, markdown) shown as the conversation
+        self._pending: tuple | None = None       # question waiting for trades / the model list to load
+        self._checked = False
         self.repaint_timer = QTimer(self)
         self.repaint_timer.setInterval(150)
         self.repaint_timer.timeout.connect(self._repaint)
@@ -66,8 +89,8 @@ class AICoachPanel(QWidget):
         b.clicked.connect(self.check_server)
         row.addWidget(b)
         self.think = QCheckBox("Deep thinking")
-        self.think.setChecked(True)
-        self.think.setToolTip("Let the model reason step by step before answering (slower, more careful)")
+        self.think.setChecked(False)
+        self.think.setToolTip("Let the model reason step by step before answering: more careful, about twice as slow")
         row.addWidget(self.think)
         self.server = QLabel("Checking Ollama…")
         self.server.setTextFormat(Qt.TextFormat.RichText)
@@ -75,7 +98,7 @@ class AICoachPanel(QWidget):
         row.addWidget(self.server, 1)
         tl.addLayout(row)
         row = QHBoxLayout()
-        row.addWidget(QLabel("<b>Review</b>"))
+        row.addWidget(QLabel("<b>Quick reviews</b>"))
         self.preset_btns = []
         for name in ai.PRESETS:
             b = QPushButton(name)
@@ -84,17 +107,22 @@ class AICoachPanel(QWidget):
             self.preset_btns.append(b)
         row.addStretch(1)
         tl.addLayout(row)
-        row = QHBoxLayout()
+        lay.addWidget(top)
+
+        bottom = QFrame()
+        bottom.setStyleSheet(f"QFrame {{ background:{C['panel']}; border:1px solid {C['border']}; border-radius:8px; }}")
+        row = QHBoxLayout(bottom)
+        row.setContentsMargins(10, 6, 10, 6)
         self.q = QLineEdit()
-        self.q.setPlaceholderText("Ask about your trades… e.g. \"Do my iron condors lose more when VIX is under 12?\" "
-                                  "(follow-ups continue the current review)")
+        self.q.setPlaceholderText("Type a question about your trades and press Enter…  e.g. \"Why am I losing on "
+                                  "BANKNIFTY?\"")
         self.q.setStyleSheet(f"QLineEdit {{ background:{C['panel2']}; color:{C['text']}; border:1px solid "
                              f"{C['border']}; border-radius:5px; padding:5px 8px; }}")
         self.q.returnPressed.connect(self._ask_free)
         row.addWidget(self.q, 1)
         self.ask_btn = QPushButton("Ask", objectName="primary")
         self.ask_btn.clicked.connect(self._ask_free)
-        self.new_btn = QPushButton("New review")
+        self.new_btn = QPushButton("New chat")
         self.new_btn.clicked.connect(self._new)
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.setEnabled(False)
@@ -103,14 +131,12 @@ class AICoachPanel(QWidget):
         self.copy_btn.clicked.connect(lambda: QGuiApplication.clipboard().setText(self.text))
         for w in (self.ask_btn, self.new_btn, self.stop_btn, self.copy_btn):
             row.addWidget(w)
-        tl.addLayout(row)
-        lay.addWidget(top)
 
         split = QSplitter(Qt.Orientation.Horizontal)
         left = QWidget(objectName="root")
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
-        ll.addWidget(QLabel(f"<span style='color:{C['muted']}'>Saved reviews</span>"))
+        ll.addWidget(QLabel(f"<span style='color:{C['muted']}'>Past answers</span>"))
         self.saved = QListWidget()
         self.saved.setStyleSheet(f"QListWidget {{ background:{C['panel2']}; color:{C['text']}; border:1px solid "
                                  f"{C['border']}; border-radius:6px; font-size:11px; }}"
@@ -131,17 +157,12 @@ class AICoachPanel(QWidget):
         self.out.setOpenExternalLinks(False)
         self.out.setStyleSheet(f"QTextBrowser {{ background:{C['panel2']}; border:1px solid {C['border']};"
                                "border-radius:6px; padding:10px; font-size:13px; }")
-        self.out.setMarkdown(
-            "### AI coach\n"
-            "Runs a **local** model through Ollama — your trades never leave this Mac.\n\n"
-            "Pick a review above, or ask your own question. The model gets the numbers this tab computed "
-            "(metrics, breakdowns, the *Why I lost* findings, open positions and alerts, your recent strategies "
-            "with market context at entry, mistakes and journal notes) for the selected period.\n\n"
-            "*Automated review of your own data — not investment advice.*")
+        self.out.setMarkdown(WELCOME)
         rl.addWidget(self.out, 1)
         split.addWidget(right)
         split.setSizes([220, 900])
         lay.addWidget(split, 1)
+        lay.addWidget(bottom)
 
     # ------------------------------------------------------------ server / models
     def check_server(self):
@@ -174,6 +195,9 @@ class AICoachPanel(QWidget):
             self.server.setText(f"<span style='color:{C['up']}'>● Ollama running locally</span> · "
                                 f"{len(names)} model(s)")
         self._busy(self.running)
+        self._checked = True
+        if names:
+            self.data_ready()
 
     def showEvent(self, e):
         super().showEvent(e)
@@ -184,38 +208,69 @@ class AICoachPanel(QWidget):
     # ------------------------------------------------------------ asking
     def _ask_free(self):
         q = self.q.text().strip()
-        if q:
+        if q and not self.running:
             self.ask(q, preset="Question", new=not self.thread_msgs)
             self.q.clear()
 
     def _new(self):
-        self.thread_msgs, self.brief = [], None
-        self.state.setText("New review — the next question starts fresh with the latest data.")
+        self.thread_msgs, self.brief, self.chat, self.text = [], None, [], ""
+        self.out.setMarkdown(WELCOME)
+        self.state.setText("New chat — the next question starts fresh with the latest data.")
+
+    def data_ready(self):
+        """Trades finished loading: run a question that was waiting for them."""
+        if self._pending and not self.running:
+            args, self._pending = self._pending, None
+            self.ask(*args)
+
+    def _render(self, partial: str | None = None, note: str = ""):
+        parts = []
+        for role, md in self.chat:
+            parts.append(f"#### 🧑 You\n{md}" if role == "user" else f"#### 🤖 Coach\n{md}")
+        if partial is not None:
+            parts.append(f"#### 🤖 Coach\n{partial or note}")
+        sb = self.out.verticalScrollBar()
+        at_end = sb.value() >= sb.maximum() - 40
+        self.out.setMarkdown("\n\n---\n\n".join(parts) if parts else WELCOME)
+        if at_end or partial is not None and not partial:
+            sb.setValue(sb.maximum())
 
     def ask(self, question: str, preset: str, new: bool):
         if self.running:
             return
         model = self.model.currentText()
         if not model:
+            if not self._checked:
+                self._pending = (question, preset, new)       # model list still loading
+                self.state.setText("Starting the local model…")
+                return
             self.state.setText(f"<span style='color:{C['down']}'>No local model available — see the status above.</span>")
             return
         d = self.data_provider() or {}
-        if not d.get("strategies") and not d.get("positions"):
-            self.state.setText(f"<span style='color:{C['down']}'>No trades loaded yet — sync or import trades "
-                               "first.</span>")
+        if not d:
+            self._pending = (question, preset, new)
+            self.state.setText("Loading your trades first…")
+            self.data_needed.emit()
             return
+        if not d.get("strategies") and not d.get("positions"):
+            self.state.setText(f"<span style='color:{C['down']}'>No trades found for this period. Connect Shoonya "
+                               "and sync, import a CSV, or pick a longer period on the Trades & P&L tab.</span>")
+            return
+        if new:
+            self.thread_msgs, self.chat = [], []
         if new or self.brief is None:
-            self.thread_msgs = []
             self.brief = ai.build_brief(d, self.period_provider())
+        self.chat.append(("user", f"**{preset}**" if preset != "Question" else question))
         msgs = ai.messages_for(self.brief, question, self.thread_msgs)
         self.current = {"review_id": uuid.uuid4().hex[:12], "time": datetime.now(), "model": model,
                         "preset": preset, "question": question, "period": self.period_provider()}
         self.text, self.think_chars = "", 0
         self.stop.clear()
         self._busy(True)
-        self.out.setMarkdown(f"**{preset}** · `{model}`\n\n*Working…*")
+        self._render("", "*Reading your trades…*")
         self.state.setText(f"Sending {len(self.brief.get('recent_closed_strategies', []))} closed and "
                            f"{len(self.brief.get('open_positions', []))} open position(s) to {model} (local)…")
+        self._t0 = time.time()
         self.repaint_timer.start()
         think = self.think.isChecked()
 
@@ -239,20 +294,20 @@ class AICoachPanel(QWidget):
 
     def _repaint(self):
         if self.text:
-            sb = self.out.verticalScrollBar()
-            at_end = sb.value() >= sb.maximum() - 30
-            self.out.setMarkdown(self._clean(self.text))
-            if at_end:
-                sb.setValue(sb.maximum())
+            self._render(self._clean(self.text))
             self.state.setText(f"Writing… {len(self.text):,} chars")
         elif self.think_chars:
             self.state.setText(f"Thinking… ({self.think_chars:,} chars of reasoning)")
+        else:
+            self.state.setText(f"Reading your trades… {int(time.time() - self._t0)}s "
+                               "(the first answer takes longer while the model loads)")
 
     def _on_done(self, res: dict):
         self.repaint_timer.stop()
         answer = self._clean(res["content"]) or "*(no answer)*"
         self.text = answer
-        self.out.setMarkdown(answer)
+        self.chat.append(("coach", answer))
+        self._render()
         stopped = self.stop.is_set()
         self.state.setText(f"{'Stopped' if stopped else 'Done'} in {res['seconds']:.0f}s · "
                            f"{res['tokens']:,} tokens · {self.current['model']} (local) · saved to ai_reviews")
@@ -268,6 +323,9 @@ class AICoachPanel(QWidget):
 
     def _on_failed(self, err: str):
         self.repaint_timer.stop()
+        if self.chat and self.chat[-1][0] == "user":
+            self.chat.pop()
+        self._render()
         self._busy(False)
         self.state.setText(f"<span style='color:{C['down']}'>Failed: {err[:300]}</span>")
 
@@ -299,7 +357,11 @@ class AICoachPanel(QWidget):
             return
         d = it.data(Qt.ItemDataRole.UserRole)
         self.text = d.get("answer", "")
-        self.out.setMarkdown(f"**{d.get('preset')}** · `{d.get('model')}` · {d.get('period')}\n\n"
-                             f"> {d.get('question', '')[:300]}\n\n{self.text}")
-        self.state.setText("Saved review (read-only). Ask a question to start a new one with the latest data.")
-        self.thread_msgs, self.brief = [], None
+        q = d.get("question", "") if d.get("preset") == "Question" else f"**{d.get('preset')}**"
+        self.chat = [("user", q), ("coach", self.text)]
+        self._render()
+        self.state.setText(f"Past answer from {d.get('model')} · period {d.get('period')}. Follow-ups continue it "
+                           "with today's data.")
+        self.thread_msgs = [{"role": "user", "content": d.get("question", "")},
+                            {"role": "assistant", "content": self.text}]
+        self.brief = None
