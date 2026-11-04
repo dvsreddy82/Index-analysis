@@ -23,7 +23,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor, QFontDatabase
 from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
@@ -48,7 +48,7 @@ C = {
 }
 
 QSS = f"""
-* {{ font-family: 'SF Pro Text', 'Segoe UI', 'Inter', sans-serif; font-size: 12px; color: {C['text']}; }}
+* {{ font-size: 12px; color: {C['text']}; }}
 QMainWindow, QWidget#root {{ background: {C['bg']}; }}
 QFrame#sidebar {{ background: {C['panel2']}; border-right: 1px solid {C['border']}; }}
 QFrame.card {{ background: {C['panel']}; border: 1px solid {C['border']}; border-radius: 8px; }}
@@ -933,7 +933,9 @@ def main():
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
     app.setApplicationName("NSE Quant Terminal")
-    app.setFont(QFont("Inter", 12))
+    font = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont)   # SF on macOS, Segoe UI on Windows
+    font.setPointSize(12)
+    app.setFont(font)
     app.setStyleSheet(QSS)
     win = MainWindow()
     win.show()
