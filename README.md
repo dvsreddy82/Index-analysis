@@ -289,6 +289,38 @@ A practical routine:
 
 **Comparing across indices:** on breadth, if large caps are Range-bound while mid and small caps are Bearish, the large-cap ETFs (NIFTYBEES, JUNIORBEES, NIF100BEES, BANKBEES) are the safer dip-buys. Only rotate into mid or small caps once their regime flips out of Bearish, or they reclaim the 200 EMA.
 
+### Real-time data from Shoonya (optional, read-only)
+
+Without a broker connection, live prices come from NSE's website snapshots, which run about 1–2 minutes behind for the option chain. With a Shoonya (Finvasia) account, the app streams real-time ticks instead.
+
+**One-time setup:** on **trade.shoonya.com → Profile → API Key**, note your **Client ID** and **Secret code**, and set the redirect URL to `http://127.0.0.1:8765/shoonya/callback`.
+
+**Credentials in `.env` (optional):** copy `.env.example` to `.env` and fill in `SHOONYA_USER_ID`, `SHOONYA_CLIENT_ID`, `SHOONYA_SECRET` and, optionally, `SHOONYA_TOTP_KEY`. `.env` is git-ignored, and `config.py` loads it at startup.
+* With these set, **Connect** skips the details dialog and goes straight to Shoonya's sign-in page.
+* The waiting window shows the current 6-digit TOTP, with a Copy button, for you to paste into Shoonya's page.
+* Values in `.env` are never copied into `~/.nse_analytics/shoonya.json`.
+
+**To connect:**
+1. Click **Connect Shoonya (real-time)**. It's in the Live and Options tab headers and in the status bar.
+2. Enter your user ID, client ID and secret, then click **Sign in with Shoonya**.
+3. Shoonya's own login page opens in your browser. Sign in there with your password and TOTP; the app never sees them.
+4. Shoonya redirects back to `127.0.0.1:8765`, where the app catches the one-time code and exchanges it for the day's access token.
+5. If the browser shows an error page instead, paste its address into the waiting dialog.
+
+With "Remember" ticked, the user ID, client ID, secret and the day's token are saved to `~/.nse_analytics/shoonya.json`. That file is owner-only and lives outside the repo. Reconnecting the same day skips the browser step.
+
+What you get once connected:
+* **Live tab:** NIFTY 50, NIFTY Bank, India VIX and the tracking ETFs update every second. The other indices stay on NSE snapshots.
+* **Options tab:** the analysis runs on Shoonya's live option chain (±40 strikes around ATM) every 5 seconds, labelled **● Shoonya real-time**. PCR covers those strikes only.
+* **Fallback:** if Shoonya drops or a lookup fails, the app falls back to NSE automatically and says why.
+
+**About the API:** Shoonya retired its old QuickAuth login (`/NorenWClientTP/`, now 502) in April 2026 and hasn't published updated docs or an updated library. The client in `shoonya_feed.py` follows OpenAlgo's maintained Shoonya integration:
+* **Token exchange:** `GenAcsTok`, with checksum `SHA-256(client_id + secret + code)`.
+* **REST:** `/NorenWClientAPI/` with a `Bearer` token, falling back to `jKey` for routes that need it.
+* **Websocket:** `wss://api.shoonya.com/NorenWSAPI/`.
+
+**No orders:** the client is read-only. It never calls an order route.
+
 ### Options tab (NIFTY / BANKNIFTY option selling)
 
 Reads NSE's live option chain (`api/option-chain-v3`) and screens **positional** premium-selling structures: an iron condor, a short strangle, and a bull-put or bear-call spread when the directional read is one-sided. It is a screening tool, not advice. Every probability is a model estimate.

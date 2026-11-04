@@ -325,6 +325,7 @@ class LiveDashboard(QWidget):
     levels_requested = Signal()
     sync_requested = Signal()
     interval_changed = Signal(int)
+    broker_requested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -380,7 +381,10 @@ class LiveDashboard(QWidget):
         self.sync_btn = QPushButton("⟳ Sync EOD")
         self.sync_btn.setToolTip("Download the latest EOD data (prices, FII/DII, OI), then refresh charts and levels")
         self.sync_btn.clicked.connect(self.sync_requested.emit)
-        for w in (self.interval, self.pause, now_btn, self.lvl_btn, self.sync_btn):
+        self.broker = QPushButton("Connect Shoonya (real-time)")
+        self.broker.setToolTip("Log in to Shoonya for real-time prices (read-only)")
+        self.broker.clicked.connect(self.broker_requested.emit)
+        for w in (self.interval, self.pause, now_btn, self.lvl_btn, self.sync_btn, self.broker):
             hl.addWidget(w)
         hv.addLayout(hl)
         lay.addWidget(head)

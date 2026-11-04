@@ -10,6 +10,27 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+def _load_dotenv(path: Path) -> None:
+    """Minimal .env loader (KEY=VALUE lines, # comments). Real environment
+    variables win over the file. The file is git-ignored — keep secrets there."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key, val = key.strip().removeprefix("export ").strip(), val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "'\"":
+            val = val[1:-1]
+        os.environ.setdefault(key, val)
+
+
+_load_dotenv(Path(__file__).resolve().parent / ".env")
+
+
 def _env(name: str, default):
     raw = os.getenv(name)
     if raw is None:

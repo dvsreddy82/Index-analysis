@@ -382,6 +382,16 @@ def import_fii_dii_csv(path: str) -> list[dict]:
     return out
 
 
+def pick_expiry(expiries: list[str], wanted: str | None = None) -> str:
+    """`wanted` if listed, else the first expiry at least 7 days out — the nearest
+    that suits a positional seller."""
+    if wanted in expiries:
+        return wanted
+    today = date.today()
+    far = [e for e in expiries if (pd.to_datetime(e, format="%d-%b-%Y").date() - today).days >= 7]
+    return far[0] if far else expiries[0]
+
+
 def _daily_from_nse(symbol: str) -> bool:
     inst = config.INSTRUMENTS.get(symbol)
     return inst is not None and inst.daily_source == "nse"
@@ -626,16 +636,17 @@ class DataService:
     def live_snapshot(self) -> dict:
         return self.live_nse.live_snapshot()
 
-    def option_chain(self, symbol: str, expiry: str | None = None) -> tuple[dict, str, list[str]]:
-        """(chain json, expiry used, all expiries).  With no expiry, picks the first
-        one at least 7 days out — the nearest that suits a positional seller."""
+    def option_expiries(self, symbol: str) -> list[str]:
         expiries = self.oc_nse.option_expiries(symbol)
         if not expiries:
             raise RuntimeError(f"NSE returned no expiries for {symbol}")
-        if expiry not in expiries:
-            today = date.today()
-            far = [e for e in expiries if (pd.to_datetime(e, format="%d-%b-%Y").date() - today).days >= 7]
-            expiry = far[0] if far else expiries[0]
+        return expiries
+
+    def option_chain(self, symbol: str, expiry: str | None = None) -> tuple[dict, str, list[str]]:
+        """(chain json, expiry used, all expiries).  With no expiry, picks the first
+        one at least 7 days out — the nearest that suits a positional seller."""
+        expiries = self.option_expiries(symbol)
+        expiry = pick_expiry(expiries, expiry)
         js = self.oc_nse.option_chain(symbol, expiry)
         if js is None:
             raise RuntimeError(f"NSE option chain unavailable for {symbol} {expiry}")

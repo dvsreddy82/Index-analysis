@@ -17,13 +17,14 @@ import html
 import logging
 import sys
 import traceback
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QFontDatabase
+from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase
 from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
@@ -37,7 +38,10 @@ from data_fetcher import DataService, import_fii_dii_csv
 from indicators import analyze, to_sr_document
 from live_view import CHART_DAYS, LiveDashboard
 from options import UNDERLYINGS, analyze_chain
-from options_view import OptionsDashboard
+from options_view import OptionsDashboard, ShoonyaDialog, ShoonyaWaitDialog
+from shoonya_feed import (INDEX_TOKENS, REDIRECT_URL, VIX_TOKEN, OAuthCatcher, ShoonyaFeed, from_env,
+                          load_settings, save_settings)
+from data_fetcher import pick_expiry
 
 log = logging.getLogger("app")
 
@@ -325,6 +329,8 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_scanner(), "Scanner")
         self.opts = OptionsDashboard()
         self.opts.refresh_requested.connect(self.load_options)
+        self.opts.broker_requested.connect(self.connect_shoonya)
+        self.live.broker_requested.connect(self.connect_shoonya)
         self.tabs.addTab(self.opts, "Options — NIFTY / BANKNIFTY")
         self._opt_busy = False
         self._opt_engine: dict[str, tuple[float, dict, pd.DataFrame]] = {}   # underlying -> (ts, analysis, daily)
@@ -348,6 +354,16 @@ class MainWindow(QMainWindow):
         split.setStretchFactor(1, 1)
 
         self.setStatusBar(QStatusBar())
+        self.shoonya = ShoonyaFeed()
+        self._opt_expiries: dict[str, tuple[float, list[str]]] = {}
+        self._last_snap: dict | None = None
+        self.broker_btn = QPushButton("○ Shoonya: connect for real-time")
+        self.broker_btn.setToolTip("Read-only live prices and option chains from your Shoonya account")
+        self.broker_btn.clicked.connect(self.connect_shoonya)
+        self.statusBar().addPermanentWidget(self.broker_btn)
+        self.rt_timer = QTimer(self)         # repaint live tiles from Shoonya ticks between NSE polls
+        self.rt_timer.setInterval(1000)
+        self.rt_timer.timeout.connect(self._realtime_tick)
         store = "MongoDB · nse_analytics" if self.svc.persistent else "IN-MEMORY (MongoDB unreachable)"
         self.db_lbl.setText(f"Store: {store}")
         self.db_lbl.setStyleSheet(f"color:{C['up'] if self.svc.persistent else C['down']}")
@@ -378,9 +394,38 @@ class MainWindow(QMainWindow):
         self._opt_busy, self._opt_pending = True, None
         svc, cache = self.svc, self._opt_engine
 
+        feed, exp_cache = self.shoonya, self._opt_expiries
+
         def job(progress):
             import time
-            js, exp, _ = svc.option_chain(underlying, expiry or None)
+            js = note = None
+            source = "nse"
+            if feed.live:
+                try:
+                    hit_e = exp_cache.get(underlying)
+                    if hit_e is None or time.time() - hit_e[0] > 3600:
+                        hit_e = exp_cache[underlying] = (time.time(), svc.option_expiries(underlying))
+                    expiries = hit_e[1]
+                    exp = pick_expiry(expiries, expiry or None)
+                    spot_key = INDEX_TOKENS["^NSEI" if underlying == "NIFTY" else "NIFTY BANK"]
+                    spot = float((feed.tick(spot_key) or {}).get("lp") or 0)
+                    if not spot:
+                        raise RuntimeError("no live index tick yet")
+                    first = (underlying, exp) not in feed.chains
+                    feed.ensure_chain(underlying, exp, spot, 50 if underlying == "NIFTY" else 100)
+                    for _ in range(30 if first else 0):           # let the first ticks arrive
+                        if feed.chain_json(underlying, exp, expiries)[1] > 0.8 * len(feed.chains[(underlying, exp)]):
+                            break
+                        time.sleep(0.1)
+                    js, live_legs = feed.chain_json(underlying, exp, expiries)
+                    if live_legs == 0:
+                        raise RuntimeError("no live option ticks")
+                    source = "shoonya"
+                except Exception as exc:
+                    log.warning("Shoonya option chain failed, using NSE: %s", exc)
+                    js, note = None, f"Shoonya unavailable: {exc}"
+            if js is None:
+                js, exp, _ = svc.option_chain(underlying, expiry or None)
             hit = cache.get(underlying)
             if hit is None or time.time() - hit[0] > 600:      # the EOD engine read changes slowly
                 sym = UNDERLYINGS[underlying]["daily"]
@@ -388,8 +433,13 @@ class MainWindow(QMainWindow):
                 engine = analyze(sym, "1D", daily, daily, svc.load_fii_dii(), svc.load_macro()) if len(daily) > 60 else {}
                 hit = cache[underlying] = (time.time(), engine, daily)
             macro = svc.load_macro()
-            vix = macro["indiavix"] if "indiavix" in macro else None
-            return analyze_chain(underlying, js, exp, hit[2], vix, hit[1])
+            vix = macro["indiavix"].dropna() if "indiavix" in macro else None
+            vt = feed.tick(VIX_TOKEN) if feed.live else None
+            if vix is not None and vt and vt.get("lp"):
+                vix = pd.concat([vix, pd.Series([float(vt["lp"])], index=[pd.Timestamp.now().normalize()])])
+            res = analyze_chain(underlying, js, exp, hit[2], vix, hit[1])
+            res["source"], res["source_note"] = source, note
+            return res
 
         task = Task(job)
         task.signals.done.connect(self._options_done)
@@ -425,7 +475,115 @@ class MainWindow(QMainWindow):
         if not snap.get("quotes"):
             self.live.ts.setText("NSE live feed unavailable — retrying")
             return
+        self._last_snap = snap
+        self._show_snapshot()
+
+    def _show_snapshot(self):
+        snap = self.shoonya.overlay_snapshot(self._last_snap)
         self.live.update_snapshot(snap)
+        if snap.get("source"):
+            self.live.ts.setText(self.live.ts.text() + f" · <span style='color:{C['up']}'>● {snap['source']}</span>")
+
+    def _realtime_tick(self):
+        if self.shoonya.live and self._last_snap and self.tabs.currentWidget() is self.live:
+            self._show_snapshot()
+        self._broker_label()
+
+    # ---------------------------------------------------------- Shoonya
+    def connect_shoonya(self):
+        if self.shoonya.live:
+            if QMessageBox.question(self, "Shoonya", "Disconnect from Shoonya real-time data?") \
+                    == QMessageBox.StandardButton.Yes:
+                self.shoonya.close()
+                self.rt_timer.stop()
+                self.opt_timer.setInterval(config.OPTIONS_REFRESH_SECONDS * 1000)
+                self._broker_label()
+            return
+        settings = load_settings()
+        if settings.get("access_token") and settings.get("token_date") == date.today().isoformat():
+            self._shoonya_run(settings, token=settings["access_token"], remember=True, reused=True)
+            return
+        self._shoonya_signin(settings)
+
+    def _shoonya_signin(self, settings: dict):
+        if from_env():                       # credentials come from .env: go straight to the browser
+            v, remember = {k: settings[k] for k in ("user_id", "client_id", "secret")}, True
+        else:
+            dlg = ShoonyaDialog(settings, REDIRECT_URL, self)
+            if dlg.exec() != ShoonyaDialog.DialogCode.Accepted:
+                return
+            v, remember = dlg.values(), dlg.remember.isChecked()
+        try:
+            catcher = OAuthCatcher()
+        except OSError as exc:
+            QMessageBox.warning(self, "Shoonya", f"Could not listen on {REDIRECT_URL} ({exc}). "
+                                "Close whatever uses that port, or paste the redirected address when asked.")
+            catcher = None
+        url = ShoonyaFeed.authorize_url(v)
+        QDesktopServices.openUrl(QUrl(url))
+        wait = ShoonyaWaitDialog(url, (lambda: catcher.code) if catcher else (lambda: None), self)
+        ok = wait.exec() == ShoonyaWaitDialog.DialogCode.Accepted
+        if catcher:
+            catcher.close()
+        if ok and wait.code:
+            self._shoonya_run(v, code=wait.code, remember=remember)
+
+    def _shoonya_run(self, settings: dict, token: str | None = None, code: str | None = None,
+                     remember: bool = True, reused: bool = False):
+        self.broker_btn.setEnabled(False)
+        self._broker_label()
+        for b in (self.broker_btn, self.opts.broker, self.live.broker):
+            b.setText("… Shoonya: connecting")
+        feed = self.shoonya
+
+        def job(progress):
+            tok = token or feed.exchange_code(settings, code)
+            msg = feed.connect(settings, tok)
+            return {"msg": msg, "token": tok, "settings": settings, "remember": remember}
+
+        task = Task(job)
+        task.signals.done.connect(self._shoonya_done)
+        task.signals.failed.connect(lambda err: self._shoonya_failed(err, settings if reused else None))
+        self._start(task)
+
+    def _shoonya_done(self, out: dict):
+        if out["remember"]:
+            save_settings(out["settings"], out["token"])
+        self.broker_btn.setEnabled(True)
+        self._status(f"Shoonya: {out['msg']} — real-time data on")
+        self.rt_timer.start()
+        self.opt_timer.setInterval(5000)          # option chain from live ticks: refresh often
+        self._broker_label()
+        if self.tabs.currentWidget() is self.opts:
+            self.opts.request()
+
+    def _shoonya_failed(self, err: str, retry_settings: dict | None = None):
+        self.broker_btn.setEnabled(True)
+        self._broker_label()
+        if retry_settings is not None:            # today's saved session no longer works: sign in again
+            self._shoonya_signin(retry_settings)
+            return
+        QMessageBox.warning(self, "Shoonya connection failed", err.split("\n\n")[0])
+
+    def closeEvent(self, event):
+        self.shoonya.close()
+        super().closeEvent(event)
+
+    def _broker_label(self):
+        f = self.shoonya
+        if f.live:
+            text, head, style = "● Shoonya: real-time", "● Shoonya live — disconnect", f"color:{C['up']}"
+        elif f.logged_in:
+            text = head = f"◐ Shoonya: {f.status}"
+            style = "color:#f59e0b"
+        else:
+            text, head, style = "○ Shoonya: connect for real-time", "Connect Shoonya (real-time)", ""
+        self.broker_btn.setText(text)
+        for b in (self.broker_btn, self.opts.broker, self.live.broker):
+            b.setStyleSheet(style)
+            b.setEnabled(self.broker_btn.isEnabled())
+        self.opts.broker.setText(head)
+        self.live.broker.setText(head)
 
     def _live_failed(self, err: str):
         self._live_busy = False
