@@ -175,6 +175,9 @@ TIMEFRAMES: dict[str, tuple[str, str]] = {
     "15m": ("15m", "60d"),
 }
 
+# Timeframes kept in index_ohlcv: the analysis timeframes plus 1-minute bars for the intraday chart.
+STORED_TIMEFRAMES: list[str] = list(TIMEFRAMES) + ["1m"]
+
 # Macro series used by the catalyst module (Yahoo tickers).
 MACRO_TICKERS: dict[str, str] = {
     "crude": "BZ=F",        # Brent crude futures

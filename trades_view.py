@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog,
                                QScrollArea, QSizePolicy, QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget,
                                QVBoxLayout, QWidget)
 
-from live_view import C
+from theme import C
 from options_view import _card, _label
 from trades_engine import _bucket_verdict as te_bucket
 
@@ -208,7 +208,6 @@ class TradesDashboard(QWidget):
     recompute_requested = Signal()            # recompute from stored data only (period change)
     import_requested = Signal(str)
     journal_saved = Signal(dict)
-    connect_requested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -236,9 +235,6 @@ class TradesDashboard(QWidget):
         self.auto = QCheckBox("Auto-sync")
         self.auto.setChecked(True)
         hl.addWidget(self.auto)
-        self.connect_btn = QPushButton("Connect Shoonya")
-        self.connect_btn.clicked.connect(self.connect_requested.emit)
-        hl.addWidget(self.connect_btn)
         b = QPushButton("Import CSV…")
         b.setToolTip("Import older trades from a broker trade-history export (date, symbol, buy/sell, qty, price)")
         b.clicked.connect(self._import)

@@ -48,6 +48,9 @@ Rules:
   treat placeholder fields as P&L.
   For open positions, compare each against this plan and lay out the options with their trade-offs;
   the decision is the trader's.
+- "institutional_positioning" is the app's rule-based FII/DII read (score −100…+100 and the writing side it
+  favours). Use it as context for which side of the market the trader's short options sit on; say when a
+  position fights it. It is not a forecast.
 - Do not predict market direction, do not promise profits, do not invent data.
 - Write in concise markdown: short headings, bullets, a small table where it helps. Amounts in ₹ with Indian
   digit grouping; index levels and strikes are points, not ₹. No preamble.
@@ -200,8 +203,10 @@ def build_brief(d: dict, period: str = "") -> dict:
                      "% captured and spot vs strikes are unknown. Do not estimate them.")
     if any(s["status"] == "open" for s in strats):
         notes.append("open_strategies list the legs and credit of open positions; their P&L is only in open_positions.")
+    inst = d.get("fii_read") or {}
     return {
         "data_notes": notes,
+        "institutional_positioning": inst or "not available",
         "as_of": datetime.now().strftime("%Y-%m-%d %H:%M"), "period": period,
         "trader": {"style": "positional NIFTY/BANKNIFTY option seller, no scalping",
                    "lot_sizes": {"NIFTY": config.NIFTY_LOT, "BANKNIFTY": config.BANKNIFTY_LOT},

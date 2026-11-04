@@ -301,7 +301,18 @@ def parse_participant_oi(text: str, day: date) -> dict:
     ocl, opl = col("option index call long"), col("option index put long")
     ocs, ops_ = col("option index call short"), col("option index put short")
     fii, cli, tot = df.loc["FII"], df.loc["CLIENT"], df.loc["TOTAL"]
-    return {
+    # every participant x instrument, e.g. pro_idx_call_short, client_idx_fut_long
+    full = {}
+    sl, ss = col("future stock long"), col("future stock short")
+    for who in ("FII", "DII", "PRO", "CLIENT"):
+        if who not in df.index:
+            continue
+        r = df.loc[who]
+        for inst, (lc, sc) in (("idx_fut", (fl, fs)), ("idx_call", (ocl, ocs)), ("idx_put", (opl, ops_)),
+                               ("stk_fut", (sl, ss))):
+            full[f"{who.lower()}_{inst}_long"] = float(r[lc])
+            full[f"{who.lower()}_{inst}_short"] = float(r[sc])
+    return {**full,
         "date": pd.Timestamp(day),
         "fii_index_fut_long": float(fii[fl]),
         "fii_index_fut_short": float(fii[fs]),
@@ -433,7 +444,9 @@ class MemoryStore:
     def __init__(self):
         self.journal_keys = {"broker_fills": ("fill_id",), "broker_orders": ("order_no", "date"),
                              "pnl_daily": ("date",), "trade_journal": ("strategy_id",),
-                             "ai_reviews": ("review_id",)}
+                             "ai_reviews": ("review_id",),
+                             "option_chain_snapshots": ("underlying", "expiry", "ts"), "sync_log": ("job",),
+                             "broker_positions": ("date",)}
         self._docs: dict[str, dict[tuple, dict]] = {n: {} for n in self.journal_keys}
         self._ohlcv: dict[tuple[str, str], pd.DataFrame] = {}
         self._fii = pd.DataFrame()
@@ -455,10 +468,12 @@ class MemoryStore:
                 coll[key] = new
         return len(docs)
 
-    def find_docs(self, name, query=None, sort=None):
+    def find_docs(self, name, query=None, sort=None, desc=False, limit=None):
         rows = [dict(d) for d in self._docs[name].values()
                 if all(d.get(k) == v for k, v in (query or {}).items() if not isinstance(v, dict))]
-        return sorted(rows, key=lambda d: d.get(sort)) if sort else rows
+        if sort:
+            rows.sort(key=lambda d: d.get(sort), reverse=desc)
+        return rows[:limit] if limit else rows
 
     def delete_docs(self, name, query):
         keys = [k for k, d in self._docs[name].items() if all(d.get(a) == b for a, b in query.items())]
@@ -474,6 +489,9 @@ class MemoryStore:
 
     def load_ohlcv(self, symbol, timeframe, start=None, limit=None):
         df = self._ohlcv.get((symbol, timeframe), pd.DataFrame())
+        if start is not None and not df.empty:
+            t = pd.Timestamp(start)
+            df = df[df.index >= (t.tz_localize(config.IST) if t.tzinfo is None else t)]
         return df.tail(limit) if limit else df
 
     def latest_timestamp(self, symbol, timeframe):
@@ -587,12 +605,12 @@ class DataService:
 
         say("Back-filling participant-wise OI (FII long/short, PCR) …")
         try:
-            have = self.store.fii_dii_dates()
+            have = self.participant_dates()
             today = date.today()
             recs = []
             for k in range(oi_backfill_days, -1, -1):
                 d = today - timedelta(days=k)
-                if d.weekday() >= 5 or pd.Timestamp(d) in have:
+                if d.weekday() >= 5 or d in have:
                     continue
                 rec = self.nse.participant_oi(d)
                 if rec:
@@ -613,6 +631,66 @@ class DataService:
 
         say("Sync complete.")
         return summary
+
+    # ---------------------------------------------------------- FII / DII only
+    def participant_dates(self) -> set[date]:
+        """Sessions whose full participant-wise OI (all four participant types) is stored."""
+        df = self.store.load_fii_dii()
+        if df.empty or "pro_idx_fut_long" not in df:
+            return set()
+        return {pd.Timestamp(d).date() for d in df.index[df["pro_idx_fut_long"].notna()]}
+
+    def cash_dates(self) -> set[date]:
+        df = self.store.load_fii_dii()
+        if df.empty or "fii_cash_net" not in df:
+            return set()
+        return {pd.Timestamp(d).date() for d in df.index[df["fii_cash_net"].notna()]}
+
+    def sync_fii_dii(self, lookback_days: int = 12) -> dict:
+        """Fetch whatever FII/DII data is newly available: NSE's provisional cash
+        figures (published ~5-7 pm IST), participant-wise OI (~7-9 pm) for any
+        recent session still missing, and the cash history pages when recent
+        cash days are missing.  Cheap to call repeatedly; returns what changed."""
+        out = {"cash_date": None, "oi_days": [], "history_days": 0, "errors": []}
+        today = date.today()
+        try:
+            cash = self.nse.fii_dii_cash()
+            if cash:
+                self.store.upsert_fii_dii([cash])
+                out["cash_date"] = pd.Timestamp(cash["date"]).date()
+        except Exception as exc:
+            out["errors"].append(f"NSE cash: {exc}")
+        recent = [today - timedelta(days=k) for k in range(lookback_days, -1, -1)]
+        recent = [d for d in recent if d.weekday() < 5]
+        have_cash = self.cash_dates()
+        if any(d not in have_cash for d in recent[:-1]):          # a past session's cash is missing
+            try:
+                hist = fetch_fii_dii_cash_history()
+                self.store.upsert_fii_dii(hist)
+                out["history_days"] = len(hist)
+            except Exception as exc:
+                out["errors"].append(f"cash history: {exc}")
+        have_oi = self.participant_dates()
+        recs = []
+        for d in recent:
+            if d in have_oi:
+                continue
+            try:
+                rec = self.nse.participant_oi(d)
+            except Exception as exc:
+                out["errors"].append(f"participant OI {d}: {exc}")
+                continue
+            if rec:
+                recs.append(rec)
+                out["oi_days"].append(d)
+            time.sleep(0.2)
+        if recs:
+            self.store.upsert_fii_dii(recs)
+        df = self.store.load_fii_dii()
+        out["latest_cash"] = max(self.cash_dates(), default=None)
+        out["latest_oi"] = max(self.participant_dates(), default=None)
+        out["rows"] = len(df)
+        return out
 
     def sync_index_archive(self, progress: Progress | None = None, workers: int = 4) -> int:
         """Back-fill / update daily OHLCV for all NSE-archive indices at once.
@@ -665,7 +743,7 @@ class DataService:
         """NSE publishes the EOD archive after the close, so during (and just after)
         the session, build today's daily bar from stored 1H candles. Not persisted:
         the archive row replaces it on the next sync."""
-        if daily.empty or not config.supports_intraday(symbol):
+        if daily.empty:
             return daily
         h = self.store.load_ohlcv(symbol, "1H")
         if h is None or h.empty:

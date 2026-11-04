@@ -54,7 +54,10 @@ CALLBACK_PORT = 8765
 REDIRECT_URL = f"http://127.0.0.1:{CALLBACK_PORT}/shoonya/callback"
 SETTINGS_FILE = config.APP_HOME / "shoonya.json"
 SETTINGS_KEYS = ("user_id", "client_id", "secret")
-INDEX_TOKENS = {"^NSEI": "NSE|26000", "NIFTY BANK": "NSE|26009"}   # documented Noren index tokens
+# The only NSE indices Shoonya streams (verified with GetQuotes over the 26000+ token range);
+# every other index stays on NSE's delayed feed.
+INDEX_TOKENS = {"^NSEI": "NSE|26000", "NIFTY BANK": "NSE|26009", "NIFTY NEXT 50": "NSE|26013",
+                "NIFTY FINANCIAL SERVICES": "NSE|26037", "NIFTY MIDCAP SELECT": "NSE|26074"}
 VIX_TOKEN = "NSE|26017"
 FRESH_SECONDS = 30            # a tick older than this is not shown as live
 CHAIN_STRIKES = 40            # strikes on each side of ATM to subscribe
@@ -316,6 +319,35 @@ class ShoonyaFeed:
             except (KeyError, ValueError, TypeError):
                 continue
         return sorted(out)
+
+    def time_series_df(self, key: str, start: float, end: float | None = None, interval: int = 1) -> pd.DataFrame:
+        """TPSeries as an OHLCV DataFrame with an IST DatetimeIndex (volume is 0 for indices)."""
+        exch, token = key.split("|", 1)
+        r = self._post("TPSeries", {"exch": exch, "token": token, "st": str(int(start)),
+                                    "et": str(int(end or time.time())), "intrv": str(interval)})
+        if r.get("stat") != "Ok":
+            if "no data" in str(r.get("emsg", "")).lower():
+                return pd.DataFrame()
+            raise RuntimeError(f"TPSeries: {r.get('emsg') or r}")
+        rows = []
+        for c in r.get("values") or []:
+            try:
+                rows.append({"timestamp": datetime.strptime(c["time"], "%d-%m-%Y %H:%M:%S"),
+                             "open": float(c["into"]), "high": float(c["inth"]), "low": float(c["intl"]),
+                             "close": float(c["intc"]), "volume": float(c.get("intv") or 0)})
+            except (KeyError, ValueError, TypeError):
+                continue
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows).set_index("timestamp").sort_index()
+        df.index = df.index.tz_localize(config.IST)
+        return df[~df.index.duplicated(keep="last")]
+
+    def key_for(self, symbol: str) -> str | None:
+        """Shoonya "EXCH|token" for an app symbol (indices Shoonya streams, and resolved ETFs)."""
+        if symbol == "INDIA VIX":
+            return VIX_TOKEN
+        return self.symbol_keys.get(symbol) or INDEX_TOKENS.get(symbol)
 
     def watch(self, keys) -> None:
         """Subscribe extra instruments (e.g. open-position legs) for live prices."""

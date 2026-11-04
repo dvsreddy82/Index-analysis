@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QHBox
                                QHeaderView, QLabel, QPushButton, QSizePolicy, QStyledItemDelegate, QTableWidget,
                                QTableWidgetItem, QVBoxLayout, QWidget)
 
-from live_view import C
+from theme import C
 
 CE_COLOR, PE_COLOR = "#ef4444", "#22c55e"
 ITM_BG = QColor(250, 204, 21, 18)          # in-the-money side tint

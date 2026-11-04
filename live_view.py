@@ -16,10 +16,7 @@ from PySide6.QtWidgets import (QComboBox, QFrame, QGridLayout, QHBoxLayout, QLab
 
 import config
 
-C = {
-    "bg": "#0b0f17", "panel": "#111827", "panel2": "#0f172a", "border": "#1f2937",
-    "text": "#e5e7eb", "muted": "#94a3b8", "accent": "#38bdf8", "up": "#22c55e", "down": "#ef4444",
-}
+from theme import C  # noqa: E402  (shared palette; re-exported for older imports)
 GROUP_COLORS = {"Large cap": "#38bdf8", "Broad market": "#a78bfa", "Mid cap": "#f59e0b",
                 "Small cap": "#f472b6", "Sectoral": "#2dd4bf"}
 MIN_TILE_W, TILE_H = 196, 204   # tiles stretch to fill the row; height is fixed
@@ -248,7 +245,11 @@ class Tile(QFrame):
         self.ltp.setStyleSheet("font-size:17px;font-weight:800;background:transparent")
         self.chg30 = QLabel("")
         self.chg30.setStyleSheet(f"font-size:10px;color:{C['muted']};background:transparent")
-        row2.addWidget(self.ltp, 1)
+        self.pts = QLabel("")
+        self.pts.setStyleSheet("font-weight:700;font-size:12px;background:transparent")
+        row2.addWidget(self.ltp)
+        row2.addWidget(self.pts, 0, Qt.AlignmentFlag.AlignBottom)
+        row2.addStretch(1)
         row2.addWidget(self.chg30, 0, Qt.AlignmentFlag.AlignBottom)
         lay.addLayout(row2)
         self.chart = MiniChart()
@@ -291,8 +292,11 @@ class Tile(QFrame):
         last, pct = q["last"], q.get("pct") or 0
         col = C["up"] if pct >= 0 else C["down"]
         self.ltp.setText(fmt_px(last))
-        self.pct.setText(fmt_chg(q))
+        ch = quote_change(q)
+        self.pct.setText(f"{pct:+.2f}%")
         self.pct.setStyleSheet(f"font-weight:700;font-size:12px;color:{col};background:transparent")
+        self.pts.setText(f"{ch:+,.2f}" if ch is not None else "")
+        self.pts.setStyleSheet(f"font-weight:700;font-size:11px;color:{col};background:transparent")
         self._style(pct)
         proj = (doc or {}).get("projection") or {}
         self.bar.set_values(proj.get("lower"), proj.get("upper"), last, q.get("low"), q.get("high"))
@@ -344,9 +348,7 @@ class LiveDashboard(QWidget):
     open_symbol = Signal(str)
     refresh_requested = Signal()
     levels_requested = Signal()
-    sync_requested = Signal()
     interval_changed = Signal(int)
-    broker_requested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -399,13 +401,7 @@ class LiveDashboard(QWidget):
         self.lvl_btn.setToolTip("Recompute levels: re-run the daily analysis for every index "
                                 "(updates zones, ranges, EOD signals)")
         self.lvl_btn.clicked.connect(self.levels_requested.emit)
-        self.sync_btn = QPushButton("⟳ Sync EOD")
-        self.sync_btn.setToolTip("Download the latest EOD data (prices, FII/DII, OI), then refresh charts and levels")
-        self.sync_btn.clicked.connect(self.sync_requested.emit)
-        self.broker = QPushButton("Connect Shoonya (real-time)")
-        self.broker.setToolTip("Log in to Shoonya for real-time prices (read-only)")
-        self.broker.clicked.connect(self.broker_requested.emit)
-        for w in (self.interval, self.pause, now_btn, self.lvl_btn, self.sync_btn, self.broker):
+        for w in (self.interval, self.pause, now_btn, self.lvl_btn):
             hl.addWidget(w)
         hv.addLayout(hl)
         lay.addWidget(head)

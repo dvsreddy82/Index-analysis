@@ -9,7 +9,8 @@
           --accent:#38bdf8; --up:#22c55e; --down:#ef4444; --amber:#f59e0b; }
   * { box-sizing:border-box; }
   html, body { margin:0; height:100%; background:var(--bg); color:var(--text);
-               font:12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; overflow:hidden; user-select:none; }
+               font:12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; overflow:hidden; user-select:none;
+               display:flex; flex-direction:column; }
   #bar { display:flex; flex-wrap:wrap; gap:4px; align-items:center; padding:6px 8px; background:var(--panel);
          border:1px solid var(--border); border-radius:8px; margin:0 0 6px 0; }
   .grp { display:flex; gap:2px; align-items:center; padding-right:6px; margin-right:4px; border-right:1px solid var(--border); }
@@ -19,7 +20,8 @@
   button:hover { border-color:var(--accent); }
   button.on { background:#0c4a6e; border-color:var(--accent); color:#fff; }
   .lbl { color:var(--muted); margin:0 4px 0 2px; }
-  #main { position:absolute; top:46px; left:0; right:0; bottom:0; display:flex; gap:6px; }
+  #bar { flex:0 0 auto; }
+  #main { position:relative; flex:1 1 auto; min-height:0; display:flex; gap:6px; }
   #main.stack { flex-direction:column; }
   .cell { position:relative; flex:1 1 0; min-width:0; min-height:0; background:var(--panel2); border:1px solid var(--border);
           border-radius:8px; overflow:hidden; display:flex; flex-direction:column; }
@@ -763,10 +765,20 @@ window.App = {
     d.ctx = Object.assign(d.ctx || {}, ctx);
     if (VIEWS[sym].bars.length) VIEWS[sym].drawLevels();
   },
+  refit() {             // the page was hidden (zero width) when data arrived: re-apply the default view
+    Object.values(VIEWS).forEach(v => { if (v.bars.length) { v.chart.timeScale().applyOptions({barSpacing: 7}); v.showDays(); } });
+  },
   setSource(text, live) { SRC = {text, live}; Object.values(VIEWS).forEach(v => v.bars.length && v.header()); },
 };
 
 initToolbar();
+// charts built while the page was hidden have no width: re-fit once they get one
+let lastW = 0;
+new ResizeObserver(entries => {
+  const w = entries[0].contentRect.width;
+  if (lastW < 80 && w >= 80) setTimeout(() => window.App.refit(), 30);
+  lastW = w;
+}).observe(document.getElementById("main"));
 SYMS.forEach(s => { VIEWS[s.id] = new View(s.id, s.name, s.und); });
 Object.values(VIEWS).forEach(v => v.chart.subscribeCrosshairMove(p => syncCross(v, p)));
 syncControls();

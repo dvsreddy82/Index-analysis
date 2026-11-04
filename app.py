@@ -2,12 +2,20 @@
 
 Layout
 ------
- ┌ Sidebar ─────┬ Chart (Plotly in QWebEngineView) ─────────────┬ Signal panel ────┐
- │ symbol       │ candles + EMAs + S/R zones + pivots │ VolProf │ Decision card     │
- │ timeframe    │ RSI                                            │ Institutional     │
- │ overlays     │ FII vs DII cash histogram + FII L/S ratio      │ Key levels table  │
- │ sync / csv   │                                                │ Catalysts         │
- └──────────────┴────────────────────────────────────────────────┴───────────────────┘
+ ┌ App bar: market status · data source · FII/DII + EOD freshness · MongoDB · Sync ▾ · Shoonya ┐
+ ├ Navigation ──┬ Page (title + purpose, then the screen) ─────────────────────────────────────┤
+ │ MARKETS      │ Live overview · Intraday chart · Option chain · FII / DII flows              │
+ │ RESEARCH     │ Index analysis · Scanner                                                     │
+ │ MY TRADING   │ Trades & P&L · AI coach                                                      │
+ └──────────────┴──────────────────────────────────────────────────────────────────────────────┘
+
+Data flows through services, not screens:
+  broker.Broker            the single Shoonya connection (read-only), sign-in, state
+  market_data.MarketData   Shoonya-first candles/quotes, stored in MongoDB for offline use
+  options_service          option-chain analysis + snapshots
+  trades_service           broker books → MongoDB → journal analytics
+  sync_service             scheduled sync: FII/DII as published, EOD, intraday, chain snapshots
+  fii_analysis             FII/DII positioning → option-writing read
 
 Run:  python app.py
 """
@@ -17,101 +25,44 @@ import html
 import logging
 import sys
 import time
-import traceback
-from datetime import date, datetime, timezone
-from zoneinfo import ZoneInfo
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase
+from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QKeySequence, QShortcut
 from PySide6.QtWebEngineCore import QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
-                               QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
-                               QMainWindow, QMessageBox, QPushButton, QScrollArea, QSplitter,
-                               QStatusBar, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
+                               QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QListWidget,
+                               QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea,
+                               QSplitter, QStackedWidget, QStatusBar, QTableWidget, QTableWidgetItem, QVBoxLayout,
                                QWidget)
 
 import config
+import fii_analysis
+from ai_view import AICoachPanel
+from broker import Broker
 from data_fetcher import DataService, import_fii_dii_csv
+from fii_view import FIIDashboard
 from indicators import analyze, to_sr_document
 from live_view import CHART_DAYS, LiveDashboard
-from options import UNDERLYINGS, analyze_chain
-from options_view import OptionsDashboard, ShoonyaDialog, ShoonyaWaitDialog
-from shoonya_feed import (INDEX_TOKENS, REDIRECT_URL, VIX_TOKEN, OAuthCatcher, ShoonyaFeed, from_env,
-                          load_settings, save_settings)
-from data_fetcher import pick_expiry
-import trades_engine as te
-from trades_view import TradesDashboard
-from ai_view import AICoachPanel
+from market_data import MarketData
+from options_service import OptionsService
+from options_view import OptionsDashboard
 from rt_chart import SYMBOLS as RT_SYMBOLS, RealtimeCharts
-from data_fetcher import fetch_intraday_1m
+from shoonya_feed import INDEX_TOKENS
+from sync_service import SyncService, market_open, now_ist
+from tasks import Runner, Task
+from theme import C, QSS, page
+from trades_service import TradesService
+from trades_view import TradesDashboard
 
 IST = ZoneInfo(config.IST)
 log = logging.getLogger("app")
-
-# ------------------------------------------------------------------ theme
-C = {
-    "bg": "#0b0f17", "panel": "#111827", "panel2": "#0f172a", "border": "#1f2937",
-    "text": "#e5e7eb", "muted": "#94a3b8", "accent": "#38bdf8",
-    "up": "#22c55e", "down": "#ef4444", "fii": "#3b82f6", "dii": "#f59e0b",
-    "ema20": "#facc15", "ema50": "#38bdf8", "ema200": "#c084fc",
-}
-
-QSS = f"""
-* {{ font-size: 12px; color: {C['text']}; }}
-QMainWindow, QWidget#root {{ background: {C['bg']}; }}
-QFrame#sidebar {{ background: {C['panel2']}; border-right: 1px solid {C['border']}; }}
-QFrame.card {{ background: {C['panel']}; border: 1px solid {C['border']}; border-radius: 8px; }}
-QLabel.h1 {{ font-size: 16px; font-weight: 700; color: {C['accent']}; }}
-QLabel.h2 {{ font-size: 11px; font-weight: 700; color: {C['muted']}; letter-spacing: 1px; }}
-QLabel.muted {{ color: {C['muted']}; }}
-QComboBox, QPushButton {{ background: {C['panel']}; border: 1px solid {C['border']};
-    border-radius: 6px; padding: 6px 10px; }}
-QComboBox QAbstractItemView {{ background: {C['panel']}; selection-background-color: #1e293b; }}
-QPushButton:hover {{ border-color: {C['accent']}; }}
-QPushButton:checked {{ background: #0c4a6e; border-color: {C['accent']}; }}
-QPushButton#primary {{ background: #0369a1; border-color: #0284c7; font-weight: 600; }}
-QPushButton#primary:hover {{ background: #0284c7; }}
-QPushButton:disabled {{ color: #475569; }}
-QCheckBox::indicator {{ width: 14px; height: 14px; }}
-QTableWidget {{ background: {C['panel']}; gridline-color: {C['border']}; border: none; }}
-QHeaderView::section {{ background: {C['panel2']}; color: {C['muted']}; border: none;
-    border-bottom: 1px solid {C['border']}; padding: 4px; font-weight: 600; }}
-QScrollArea {{ border: none; background: {C['bg']}; }}
-QStatusBar {{ background: {C['panel2']}; color: {C['muted']}; }}
-QSplitter::handle {{ background: {C['border']}; }}
-QTabWidget::pane {{ border: none; }}
-QTabBar::tab {{ background: {C['panel2']}; color: {C['muted']}; padding: 6px 16px; border: none;
-    border-bottom: 2px solid transparent; }}
-QTabBar::tab:selected {{ color: {C['text']}; border-bottom: 2px solid {C['accent']}; }}
-"""
-
-
-# ------------------------------------------------------------------ background tasks
-class TaskSignals(QObject):
-    progress = Signal(str)
-    done = Signal(object)
-    failed = Signal(str)
-
-
-class Task(QRunnable):
-    """Run `fn(progress_cb)` on the thread pool and report back via signals."""
-
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-        self.signals = TaskSignals()
-
-    def run(self):
-        try:
-            self.signals.done.emit(self.fn(self.signals.progress.emit))
-        except Exception as exc:
-            log.exception("Background task failed")
-            self.signals.failed.emit(f"{exc}\n\n{traceback.format_exc(limit=3)}")
 
 
 def pair_ratio(svc: DataService, symbol: str, daily: pd.DataFrame) -> dict | None:
@@ -294,659 +245,389 @@ def bullets(items: list[str], color: str = C["text"]) -> str:
 
 
 class MainWindow(QMainWindow):
+    """Shell: app bar, navigation rail and pages. Data work lives in the services
+    (broker, market data, options, trades, sync); this class wires them to screens."""
+
+    NAV = [("MARKETS", [("live", "◉  Live overview"), ("intraday", "◔  Intraday chart"),
+                        ("chain", "▦  Option chain"), ("fii", "⇅  FII / DII flows")]),
+           ("RESEARCH", [("analysis", "◇  Index analysis"), ("scanner", "☰  Scanner")]),
+           ("MY TRADING", [("trades", "₹  Trades & P&L"), ("ai", "✦  AI coach")])]
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("NSE Quant Terminal — Index & ETF Swing Desk")
-        # Fit the available screen (never larger than it), centred.
+        self.setWindowTitle("NSE Quant Terminal — Index & ETF desk")
         avail = QApplication.primaryScreen().availableGeometry()
         self.resize(min(1680, int(avail.width() * 0.95)), min(980, int(avail.height() * 0.92)))
         self.move(avail.center() - self.rect().center())
-        self.pool = QThreadPool.globalInstance()
-        self._tasks: set[Task] = set()   # keep tasks (and their signal objects) alive until finished
+        # ---- services
+        self.runner = Runner()
+        self.pool = self.runner.pool
+        self.svc = DataService()
+        self.broker = Broker(self.runner, self)
+        self.shoonya = self.broker.feed                    # read-only handle for screens
+        self.market = MarketData(self.svc, self.broker)
+        self.options = OptionsService(self.svc, self.broker, self.market)
+        self.trades_svc = TradesService(self.svc, self.broker, self.options)
+        self.sync_svc = SyncService(self.svc, self.broker, self.market, self.runner, self)
         self.result: dict | None = None
         self.fii = pd.DataFrame()
         self._chart_seq = 0
-        self.svc = DataService()
+        self._last_snap: dict | None = None
+        self._flags = {"live": False, "opt": False, "trades": False, "rtc": False, "fii": False}
+        self._pending: dict[str, object] = {}
+        self._rtc_loaded = 0.0
+        self._rtc_need_fit = False
 
+        # ---- layout: app bar / (nav | pages)
         root = QWidget(objectName="root")
         self.setCentralWidget(root)
-        outer = QHBoxLayout(root)
-        outer.setContentsMargins(0, 0, 0, 0)
+        v = QVBoxLayout(root)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        v.addWidget(self._build_appbar())
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        v.addLayout(body, 1)
+        body.addWidget(self._build_nav())
+        self.stack = QStackedWidget()
+        body.addWidget(self.stack, 1)
+        self.pages: dict[str, QWidget] = {}
+        self._build_pages()
+        self.setStatusBar(QStatusBar())
+
+        # ---- wiring
+        self.broker.changed.connect(self._broker_state)
+        self.broker.connected.connect(self._broker_connected)
+        self.broker.disconnected.connect(self._broker_disconnected)
+        self.sync_svc.status_changed.connect(self._sync_state)
+        self.sync_svc.fii_updated.connect(lambda _o: self.load_fii())
+        self.sync_svc.eod_updated.connect(self._eod_done)
+        self.sync_svc.chains_due.connect(self._chains_due)
+        self.sync_svc.progress.connect(self._status)
+
+        self.live_timer = QTimer(self)
+        self.live_timer.setInterval(config.LIVE_REFRESH_SECONDS * 1000)
+        self.live_timer.timeout.connect(self.poll_live)
+        self.live_timer.start()
+        self.rt_timer = QTimer(self)               # 1 s: live tiles, intraday ticks, clock
+        self.rt_timer.setInterval(1000)
+        self.rt_timer.timeout.connect(self._second)
+        self.rt_timer.start()
+        self.trades_timer = QTimer(self)
+        self.trades_timer.setInterval(config.TRADES_SYNC_SECONDS * 1000)
+        self.trades_timer.timeout.connect(self._trades_tick)
+        self.trades_timer.start()
+        self._trades_ticks = 0
+        self.opt_timer = QTimer(self)
+        self.opt_timer.setInterval(config.OPTIONS_REFRESH_SECONDS * 1000)
+        self.opt_timer.timeout.connect(lambda: self.current_page() == "chain" and self.opts.request())
+        self.opt_timer.start()
+
+        self._broker_state()
+        self._sync_state()
+        self.nav.setCurrentRow(1)                  # Live overview
+        self.run_analysis()
+        self.compute_levels()
+        self.load_fii()
+        self.broker.auto_connect()                 # today's saved Shoonya session, silently
+        self.sync_svc.start()
+
+    # ================================================================== shell
+    def _build_appbar(self) -> QFrame:
+        bar = QFrame(objectName="appbar")
+        bar.setFixedHeight(46)
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(16, 0, 12, 0)
+        h.setSpacing(10)
+        t = QLabel("NSE QUANT TERMINAL")
+        t.setStyleSheet(f"font-size:14px;font-weight:800;color:{C['accent']};letter-spacing:1px")
+        h.addWidget(t)
+        self.clock_lbl = QLabel("")
+        self.clock_lbl.setTextFormat(Qt.TextFormat.RichText)
+        h.addWidget(self.clock_lbl)
+        h.addStretch(1)
+        self.fresh_lbl = QLabel("")
+        self.fresh_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self.fresh_lbl.setStyleSheet("font-size:11px")
+        h.addWidget(self.fresh_lbl)
+        self.store_lbl = QLabel("")
+        self.store_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self.store_lbl.setStyleSheet("font-size:11px")
+        h.addWidget(self.store_lbl)
+        self.sync_btn = QPushButton("⟳ Sync")
+        menu = QMenu(self.sync_btn)
+        menu.addAction("Sync everything now (EOD prices, FII/DII, macro)", self.sync)
+        menu.addAction("Check for new FII/DII data", lambda: self.sync_svc.run_fii("manual"))
+        menu.addAction("Back-fill intraday candles from Shoonya", lambda: self.sync_svc.run_intraday(full=True))
+        menu.addSeparator()
+        menu.addAction("Import FII/DII history (CSV)…", self.import_csv)
+        self.sync_btn.setMenu(menu)
+        h.addWidget(self.sync_btn)
+        self.broker_btn = QPushButton("Connect Shoonya")
+        self.broker_btn.setToolTip("Read-only real-time prices, option chains and your positions from Shoonya")
+        self.broker_btn.clicked.connect(lambda: self.broker.toggle(self))
+        h.addWidget(self.broker_btn)
+        return bar
+
+    def _build_nav(self) -> QFrame:
+        nav = QFrame(objectName="nav")
+        nav.setFixedWidth(196)
+        lay = QVBoxLayout(nav)
+        lay.setContentsMargins(0, 10, 0, 10)
+        self.nav = QListWidget(objectName="navlist")
+        self.nav.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._nav_keys: list[str | None] = []
+        for section, items in self.NAV:
+            head = QListWidgetItem(section)
+            head.setFlags(Qt.ItemFlag.NoItemFlags)
+            f = QFont(self.font())
+            f.setBold(True)
+            f.setPointSizeF(max(f.pointSizeF() - 2, 9))
+            head.setFont(f)
+            head.setForeground(QColor(C["faint"]))
+            self.nav.addItem(head)
+            self._nav_keys.append(None)
+            for key, text in items:
+                self.nav.addItem(QListWidgetItem(text))
+                self._nav_keys.append(key)
+        self.nav.currentRowChanged.connect(self._nav_changed)
+        lay.addWidget(self.nav, 1)
+        lay.addWidget(wrap_label(f"<span style='font-size:10px;color:{C['faint']}'>Read-only analytics. "
+                                 "Not investment advice.</span>", "muted"))
+        for i, key in enumerate(k for k in self._nav_keys if k):
+            sc = QShortcut(QKeySequence(f"Ctrl+{i + 1}"), self)
+            sc.activated.connect(lambda k=key: self.show_page(k))
+        return nav
+
+    def _build_pages(self):
+        # Markets
+        self.live = LiveDashboard()
+        self.live.open_symbol.connect(self.open_symbol)
+        self.live.refresh_requested.connect(self.poll_live)
+        self.live.levels_requested.connect(lambda: self.compute_levels(force=True))
+        self.live.interval_changed.connect(lambda s: self.live_timer.setInterval(s * 1000))
+        self._add("live", "Live overview", "Every index and ETF on one screen: live price, today's move, key levels "
+                  "and the EOD signal · real-time from Shoonya where it streams, NSE (≈15 s) for the rest", self.live)
+        self.rtc = RealtimeCharts()
+        self.rtc.reload_requested.connect(lambda: self.load_rt_chart(force=True))
+        self.rtc.alert_fired.connect(self._chart_alert)
+        self._add("intraday", "Intraday chart", "NIFTY 50 and BANKNIFTY candles with indicators, levels, your strikes, "
+                  "drawings and price alerts · candles are stored in MongoDB for offline use", self.rtc)
+        self.opts = OptionsDashboard()
+        self.opts.refresh_requested.connect(self.load_options)
+        self._add("chain", "Option chain", "NIFTY / BANKNIFTY chain, OI and IV charts, and the option-selling "
+                  "analysis · snapshots every 5 min are kept in MongoDB", self.opts)
+        self.fii_view = FIIDashboard()
+        self.fii_view.sync_requested.connect(lambda: self.sync_svc.run_fii("manual"))
+        self.fii_view.import_requested.connect(self._import_fii_path)
+        self.fii_view.zones_requested.connect(lambda: self._chains_due(force=True))
+        self._add("fii", "FII / DII flows", "Institutional cash flows and F&O positioning → a direction for option "
+                  "writing · synced automatically as NSE publishes (≈5–9 pm IST)", self.fii_view)
+        # Research
+        analysis = QWidget(objectName="root")
+        al = QHBoxLayout(analysis)
+        al.setContentsMargins(0, 0, 0, 0)
         split = QSplitter(Qt.Orientation.Horizontal)
         split.setChildrenCollapsible(False)
         self.split = split
-        outer.addWidget(split)
         self.sidebar = self._build_sidebar()
         split.addWidget(self.sidebar)
-
         self.web = QWebEngineView()
         s = self.web.settings()
         s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
         self.web.page().setBackgroundColor(Qt.GlobalColor.black)
         self.web.setHtml(f"<body style='background:{C['bg']};color:{C['muted']};"
                          "font-family:sans-serif;padding:40px'>Loading market data…</body>")
-        self.live = LiveDashboard()
-        self.live.open_symbol.connect(self.open_symbol)
-        self.live.refresh_requested.connect(self.poll_live)
-        self.live.levels_requested.connect(lambda: self.compute_levels(force=True))
-        self.live.sync_requested.connect(self.sync)
-        self.live.interval_changed.connect(lambda s: self.live_timer.setInterval(s * 1000))
-        self.tabs = QTabWidget()
-        self.tabs.addTab(self.live, "● Live — all indices")
-        self.rtc = RealtimeCharts()
-        self.rtc.reload_requested.connect(lambda: self.load_rt_chart(force=True))
-        self.rtc.broker_requested.connect(self.connect_shoonya)
-        self.rtc.alert_fired.connect(self._chart_alert)
-        self.tabs.addTab(self.rtc, "Realtime chart — NIFTY / BANKNIFTY")
-        self._rtc_busy = False
-        self._rtc_loaded = 0.0
-        self._rtc_source = ""
-        self._chart_opt_busy: set[str] = set()
-        self.rtc_timer = QTimer(self)        # tick-by-tick candle updates while the chart tab is open
-        self.rtc_timer.setInterval(1000)
-        self.rtc_timer.timeout.connect(self._rtc_tick)
-        self.rtc_timer.start()
-        self.tabs.addTab(self.web, "Chart")
-        self.tabs.addTab(self._build_scanner(), "Scanner")
-        self.opts = OptionsDashboard()
-        self.opts.refresh_requested.connect(self.load_options)
-        self.opts.broker_requested.connect(self.connect_shoonya)
-        self.live.broker_requested.connect(self.connect_shoonya)
-        self.tabs.addTab(self.opts, "Option chain — NIFTY / BANKNIFTY")
+        split.addWidget(self.web)
+        self.panel = self._build_panel()
+        split.addWidget(self.panel)
+        split.setStretchFactor(1, 1)
+        al.addWidget(split)
+        self._add("analysis", "Index analysis", "Daily / hourly / 15-min analysis of any index or ETF: zones, pivots, "
+                  "volume profile, institutional flow and the decision card", analysis)
+        self._add("scanner", "Scanner", "Daily analysis of all 56 indices and ETFs in one sortable table",
+                  self._build_scanner())
+        # My trading
         self.trades = TradesDashboard()
         self.trades.sync_requested.connect(lambda: self.sync_trades(pull=True))
         self.trades.recompute_requested.connect(lambda: self.sync_trades(pull=False))
         self.trades.import_requested.connect(self.import_trades)
         self.trades.journal_saved.connect(self.save_journal)
-        self.trades.connect_requested.connect(self.connect_shoonya)
-        self.tabs.addTab(self.trades, "Trades && P&&L")
-        self.ai = AICoachPanel(lambda: self.trades.data, self.svc.store, lambda: self.trades.period.currentText())
-        self.ai.data_needed.connect(lambda: self.sync_trades(pull=self.shoonya.live))
-        self.tabs.addTab(self.ai, "🤖 AI coach — chat about my trades")
-        self._opt_ctx: dict[str, tuple[float, dict]] = {}
-        self._trades_busy = False
-        self._trades_pending: bool | None = None
-        self._last_book: dict = {}
-        self._ctx_cache: dict[str, dict] = {}
-        self.trades_timer = QTimer(self)
-        self.trades_timer.setInterval(config.TRADES_SYNC_SECONDS * 1000)
-        self.trades_timer.timeout.connect(self._trades_tick)
-        self.trades_timer.start()
-        self._trades_ticks = 0
-        self._opt_busy = False
-        self._opt_engine: dict[str, tuple[float, dict, pd.DataFrame]] = {}   # underlying -> (ts, analysis, daily)
-        self.opt_timer = QTimer(self)
-        self.opt_timer.setInterval(config.OPTIONS_REFRESH_SECONDS * 1000)
-        self.opt_timer.timeout.connect(lambda: self.tabs.currentWidget() is self.opts and self.opts.request())
-        self.opt_timer.start()
-        self.tabs.currentChanged.connect(self._tab_changed)
-        split.addWidget(self.tabs)
-        self.panel = self._build_panel()
-        split.addWidget(self.panel)
-        split.setSizes([230, 1030, 420])
-        self.panel.setVisible(False)    # Live tab uses the full width…
-        self.sidebar.setVisible(False)  # …its own header has refresh/sync controls
+        self._add("trades", "Trades & P&L", "Positions with management alerts, orders, fills, history, performance, "
+                  "why you lost, and your journal · synced from Shoonya into MongoDB", self.trades)
+        self.ai = AICoachPanel(lambda: {**self.trades.data, "fii_read": self._fii_brief()} if self.trades.data else {},
+                               self.svc.store, lambda: self.trades.period.currentText())
+        self.ai.data_needed.connect(lambda: self.sync_trades(pull=self.broker.live))
+        self._add("ai", "AI coach", "Chat with a local model (Ollama) about your own trades — nothing leaves this Mac",
+                  self.ai)
 
-        self._live_busy = False
-        self.live_timer = QTimer(self)
-        self.live_timer.setInterval(config.LIVE_REFRESH_SECONDS * 1000)
-        self.live_timer.timeout.connect(self.poll_live)
-        self.live_timer.start()
-        split.setStretchFactor(1, 1)
+    def _add(self, key: str, title: str, subtitle: str, widget: QWidget):
+        w, _head = page(title, subtitle, widget)
+        self.pages[key] = w
+        self.stack.addWidget(w)
 
-        self.setStatusBar(QStatusBar())
-        self.shoonya = ShoonyaFeed()
-        self._opt_expiries: dict[str, tuple[float, list[str]]] = {}
-        self._last_snap: dict | None = None
-        self.broker_btn = QPushButton("○ Shoonya: connect for real-time")
-        self.broker_btn.setToolTip("Read-only live prices and option chains from your Shoonya account")
-        self.broker_btn.clicked.connect(self.connect_shoonya)
-        self.statusBar().addPermanentWidget(self.broker_btn)
-        self.rt_timer = QTimer(self)         # repaint live tiles from Shoonya ticks between NSE polls
-        self.rt_timer.setInterval(1000)
-        self.rt_timer.timeout.connect(self._realtime_tick)
-        store = "MongoDB · nse_analytics" if self.svc.persistent else "IN-MEMORY (MongoDB unreachable)"
-        self.db_lbl.setText(f"Store: {store}")
-        self.db_lbl.setStyleSheet(f"color:{C['up'] if self.svc.persistent else C['down']}")
-        self.run_analysis()
-        self.compute_levels()
+    def show_page(self, key: str):
+        self.nav.setCurrentRow(self._nav_keys.index(key))
+
+    def current_page(self) -> str | None:
+        w = self.stack.currentWidget()
+        return next((k for k, p in self.pages.items() if p is w), None)
+
+    def _nav_changed(self, row: int):
+        key = self._nav_keys[row] if 0 <= row < len(self._nav_keys) else None
+        if key is None:
+            return
+        self.stack.setCurrentWidget(self.pages[key])
+        if key == "analysis":
+            w = self.split.width() or self.width() - 200
+            side, panel = max(210, int(w * 0.17)), max(340, int(w * 0.28))
+            self.split.setSizes([side, max(w - side - panel, 300), panel])
+        elif key == "live":
+            self.poll_live()
+        elif key == "intraday":
+            self.load_rt_chart()
+            self._chains_due()
+            if self._rtc_need_fit:
+                self._rtc_need_fit = False
+                QTimer.singleShot(80, self.rtc.refit)
+        elif key == "chain" and self.opts.res is None:
+            self.opts.request()
+        elif key in ("trades", "ai") and not self.trades.data:
+            self.sync_trades(pull=self.broker.live)
+        elif key == "fii" and len(self.fii_view.zone_res) < 2:
+            self._chains_due(force=True)
+
+    # ================================================================== status
+    def _second(self):
+        t = now_ist()
+        open_ = market_open(t)
+        self.clock_lbl.setText(
+            f"<span style='color:{C['up'] if open_ else C['muted']}'>● {'Market open' if open_ else 'Market closed'}"
+            f"</span> <span style='color:{C['faint']}'>{t:%a %d %b · %H:%M:%S} IST</span>")
+        if self.current_page() == "intraday":
+            self.load_rt_chart()                   # no-op until the reload interval has passed
+        if self.broker.live:
+            if self._last_snap and self.current_page() == "live":
+                self._show_snapshot()
+            self._rtc_tick()
+
+    def _broker_state(self):
+        kind, text, color = self.broker.state()
+        self.broker_btn.setText({"live": "● Shoonya live", "connecting": "… Connecting",
+                                 "degraded": "◐ Shoonya", "off": "Connect Shoonya"}[kind])
+        self.broker_btn.setToolTip(text + (" — click to disconnect" if kind in ("live", "degraded") else
+                                           " — read-only prices, chains and positions"))
+        self.broker_btn.setStyleSheet(f"color:{color};font-weight:600" if kind != "off" else "")
+        self.broker_btn.setEnabled(kind != "connecting")
+        self._sync_state()
+
+    def _sync_state(self):
+        s = self.sync_svc.summary()
+
+        def day(v):
+            try:
+                return pd.Timestamp(v).strftime("%d %b") if v and v != "None" else "—"
+            except ValueError:
+                return "—"
+
+        def ago(sec):
+            if sec is None:
+                return "never"
+            return f"{sec / 60:.0f} min ago" if sec < 3600 else f"{sec / 3600:.0f} h ago" if sec < 86400 \
+                else f"{sec / 86400:.0f} d ago"
+        busy = s["busy"]
+        kind, text, color = self.broker.state()
+        src = (f"<span style='color:{C['up']}'>● real-time</span>" if kind == "live" else
+               f"<span style='color:{C['warn']}'>● NSE delayed</span>")
+        self.fresh_lbl.setText(
+            f"{src} &nbsp; <span style='color:{C['muted']}'>FII/DII <b style='color:{C['text']}'>{day(s['fii_cash'])}"
+            f"</b> · OI {day(s['fii_oi'])} · EOD {ago(s['eod_age'])}"
+            + (f" · <span style='color:{C['warn']}'>syncing {', '.join(busy)}…</span>" if busy else "") + "</span>")
+        store = "MongoDB" if self.svc.persistent else "in-memory (MongoDB unreachable)"
+        self.store_lbl.setText(f"<span style='color:{C['up'] if self.svc.persistent else C['down']}'>● {store}</span>")
+        self.fii_view.set_freshness(
+            f"Cash data to <b>{day(s['fii_cash'])}</b> · participant OI to <b>{day(s['fii_oi'])}</b> · "
+            f"<span style='color:{C['muted']}'>NSE publishes ≈5–9 pm IST; checked every 15 min from 4:30 pm until "
+            "today's data is in, and at start-up</span>", "fii_dii" in busy)
+
+    def _status(self, msg: str):
+        self.status_lbl.setText(msg)
+        self.statusBar().showMessage(msg)
+
+    def _broker_connected(self, msg: str):
+        self._status(f"Shoonya: {msg} — real-time data on")
+        self.opt_timer.setInterval(5000)                   # live chain: refresh often
+        if self.current_page() == "chain":
+            self.opts.request()
+        self.sync_trades(pull=True)
+        self.load_rt_chart(force=True)
         self.poll_live()
 
-    # ---------------------------------------------------------- live
-    def _tab_changed(self, idx: int):
-        page = self.tabs.widget(idx)
-        self.panel.setVisible(page is self.web)
-        self.sidebar.setVisible(page not in (self.live, self.opts, self.trades, self.rtc, self.ai))
-        if page is self.ai and not self.trades.data:
-            self.sync_trades(pull=self.shoonya.live)
-        if page is self.rtc:
-            self.load_rt_chart()
-            self._chart_option_levels()
-        if page is self.web:
-            # Sidebar ~15%, signal panel ~26% (min 340px), chart gets the rest.
-            w = self.split.width()
-            side, panel = max(200, int(w * 0.15)), max(340, int(w * 0.26))
-            self.split.setSizes([side, max(w - side - panel, 300), panel])
-        if self.tabs.widget(idx) is self.live:
-            self.poll_live()
-        if page is self.opts and self.opts.res is None:
-            self.opts.request()
-        if page is self.trades and not self.trades.data:
-            self.sync_trades(pull=self.shoonya.live)
+    def _broker_disconnected(self):
+        self.opt_timer.setInterval(config.OPTIONS_REFRESH_SECONDS * 1000)
+        self._status("Shoonya disconnected — using NSE delayed data and stored history")
 
-    # ---------------------------------------------------------- options
-    def load_options(self, underlying: str, expiry: str):
-        if self._opt_busy:
-            self._opt_pending = (underlying, expiry)    # run the latest request once this one returns
+    def closeEvent(self, event):
+        self.broker.feed.close()
+        super().closeEvent(event)
+
+    def _start(self, task):
+        """Run a pre-built Task (scanner) through the shared runner."""
+        self.runner._live.add(task)
+        for sig in (task.signals.done, task.signals.failed):
+            sig.connect(lambda *_a, t=task: self.runner._live.discard(t))
+        self.pool.start(task)
+
+    def _once(self, key: str, fn, done, failed=None, *args):
+        """Run `fn` in the background unless one is already running; remember the
+        latest request and replay it when the running one finishes."""
+        if self._flags.get(key):
+            self._pending[key] = args
             return
-        self._opt_busy, self._opt_pending = True, None
-        task = Task(lambda progress: self._options_analysis(underlying, expiry))
-        task.signals.done.connect(self._options_done)
-        task.signals.failed.connect(self._options_failed)
-        self._start(task)
+        self._flags[key] = True
 
-    def _options_analysis(self, underlying: str, expiry: str | None) -> dict:
-        """Option-chain analysis (Shoonya live chain, else NSE). Runs on a worker thread."""
-        import time
-        svc, cache, feed, exp_cache = self.svc, self._opt_engine, self.shoonya, self._opt_expiries
-        js = note = None
-        source = "nse"
-        if feed.live:
-            try:
-                hit_e = exp_cache.get(underlying)
-                if hit_e is None or time.time() - hit_e[0] > 3600:
-                    hit_e = exp_cache[underlying] = (time.time(), svc.option_expiries(underlying))
-                expiries = hit_e[1]
-                exp = pick_expiry(expiries, expiry or None)
-                spot_key = INDEX_TOKENS["^NSEI" if underlying == "NIFTY" else "NIFTY BANK"]
-                spot = float((feed.tick(spot_key) or {}).get("lp") or 0)
-                if not spot:
-                    raise RuntimeError("no live index tick yet")
-                first = (underlying, exp) not in feed.chains
-                feed.ensure_chain(underlying, exp, spot, 50 if underlying == "NIFTY" else 100)
-                for _ in range(30 if first else 0):           # let the first ticks arrive
-                    if feed.chain_json(underlying, exp, expiries)[1] > 0.8 * len(feed.chains[(underlying, exp)]):
-                        break
-                    time.sleep(0.1)
-                js, live_legs = feed.chain_json(underlying, exp, expiries)
-                if live_legs == 0:
-                    raise RuntimeError("no live option ticks")
-                source = "shoonya"
-            except Exception as exc:
-                log.warning("Shoonya option chain failed, using NSE: %s", exc)
-                js, note = None, f"Shoonya unavailable: {exc}"
-        if js is None:
-            js, exp, _ = svc.option_chain(underlying, expiry or None)
-        hit = cache.get(underlying)
-        if hit is None or time.time() - hit[0] > 600:      # the EOD engine read changes slowly
-            sym = UNDERLYINGS[underlying]["daily"]
-            daily = svc.load_ohlcv(sym, "1D")
-            engine = analyze(sym, "1D", daily, daily, svc.load_fii_dii(), svc.load_macro()) if len(daily) > 60 else {}
-            hit = cache[underlying] = (time.time(), engine, daily)
-        macro = svc.load_macro()
-        vix = macro["indiavix"].dropna() if "indiavix" in macro else None
-        vt = feed.tick(VIX_TOKEN) if feed.live else None
-        if vix is not None and vt and vt.get("lp"):
-            vix = pd.concat([vix, pd.Series([float(vt["lp"])], index=[pd.Timestamp.now().normalize()])])
-        res = analyze_chain(underlying, js, exp, hit[2], vix, hit[1])
-        res["source"], res["source_note"] = source, note
-        return res
+        def fin(cb):
+            def inner(x):
+                self._flags[key] = False
+                if cb:
+                    cb(x)
+                if key in self._pending:
+                    nxt = self._pending.pop(key)
+                    getattr(self, {"opt": "load_options", "trades": "sync_trades"}[key])(*nxt) \
+                        if key in ("opt", "trades") else None
+            return inner
+        self.runner.start(lambda _p: fn(*args), fin(done), fin(failed or (lambda e: log.warning("%s: %s", key, e))))
 
-    def _options_done(self, res: dict):
-        self._opt_busy = False
-        self._opt_ctx[res["underlying"]] = (time.time(), res)      # stamped on new fills (Trades tab)
-        self.rtc.set_option_levels(res["underlying"], res)          # OI walls / max pain on the chart
-        self.opts.set_result(res)
-        self._options_next()
-
-    def _options_failed(self, err: str):
-        self._opt_busy = False
-        self.opts.set_error(err.splitlines()[0] if err else "unknown error")
-        self._options_next()
-
-    def _options_next(self):
-        if getattr(self, "_opt_pending", None):
-            self.load_options(*self._opt_pending)
-
+    # ================================================================== live overview
     def poll_live(self):
-        """Fetch live quotes in the background; skipped while hidden or paused."""
-        if self._live_busy or self.live.paused() or self.tabs.currentWidget() is not self.live:
+        if self.live.paused() or self.current_page() != "live" or self._flags["live"]:
             return
-        self._live_busy = True
-        task = Task(lambda _p: self.svc.live_snapshot())
-        task.signals.done.connect(self._live_done)
-        task.signals.failed.connect(self._live_failed)
-        self._start(task)
+        self._flags["live"] = True
+        self.runner.start(lambda _p: self.svc.live_snapshot(), self._live_done, self._live_failed)
 
     def _live_done(self, snap: dict):
-        self._live_busy = False
+        self._flags["live"] = False
         if not snap.get("quotes"):
             self.live.ts.setText("NSE live feed unavailable — retrying")
             return
         self._last_snap = snap
         self._show_snapshot()
 
+    def _live_failed(self, err: str):
+        self._flags["live"] = False
+        log.warning("Live poll failed: %s", err.splitlines()[0])
+        self.live.ts.setText("Live poll failed — retrying")
+
     def _show_snapshot(self):
-        snap = self.shoonya.overlay_snapshot(self._last_snap)
+        snap = self.broker.feed.overlay_snapshot(self._last_snap)
         self.live.update_snapshot(snap)
         if snap.get("source"):
             self.live.ts.setText(self.live.ts.text() + f" · <span style='color:{C['up']}'>● {snap['source']}</span>")
 
-    def _realtime_tick(self):
-        if self.shoonya.live and self._last_snap and self.tabs.currentWidget() is self.live:
-            self._show_snapshot()
-        self._broker_label()
-
-    # ---------------------------------------------------------- realtime chart
-    RT_RELOAD_LIVE, RT_RELOAD_DELAYED = 120, 30   # seconds between history re-pulls
-
-    def load_rt_chart(self, force: bool = False):
-        """Seed / reconcile the intraday candles: Shoonya TPSeries when connected,
-        otherwise Yahoo 1-minute bars (delayed)."""
-        if self._rtc_busy:
-            return
-        live = self.shoonya.live
-        every = self.RT_RELOAD_LIVE if live else self.RT_RELOAD_DELAYED
-        if not force and time.time() - self._rtc_loaded < every:
-            return
-        self._rtc_busy = True
-        feed, svc = self.shoonya, self.svc
-
-        def job(_progress):
-            out, src = {}, ""
-            if live:
-                try:
-                    for sym, _ in RT_SYMBOLS:
-                        out[sym] = feed.time_series(INDEX_TOKENS[sym], time.time() - 9 * 86400)
-                    src = "Shoonya real-time · 1-min candles + live ticks"
-                except Exception as exc:          # fall back rather than leave the chart empty
-                    log.warning("TPSeries failed, using Yahoo: %s", exc)
-                    out = {}
-            if not out:
-                out = {sym: fetch_intraday_1m(sym, 7) for sym, _ in RT_SYMBOLS}
-                src = "Yahoo 1-min (delayed) — connect Shoonya for real-time"
-            daily = {}
-            for sym, _ in RT_SYMBOLS:
-                try:
-                    daily[sym] = svc.load_ohlcv(sym, "1D")
-                except Exception as exc:
-                    log.warning("daily bars for chart: %s", exc)
-            return out, src, daily
-
-        task = Task(job)
-        task.signals.done.connect(self._rtc_done)
-        task.signals.failed.connect(self._rtc_failed)
-        self._start(task)
-
-    def _rtc_done(self, payload):
-        data, src, daily = payload
-        for sym, df in daily.items():
-            self.rtc.set_daily(sym, df)
-        self._rtc_busy, self._rtc_loaded, self._rtc_source = False, time.time(), src
-        snap = self._last_snap or {}
-        for sym, _ in RT_SYMBOLS:
-            self.rtc.set_prev_close(sym, ((snap.get("quotes") or {}).get(sym) or {}).get("prev"))
-        self.rtc.set_history(data, src)
-
-    def _rtc_failed(self, err: str):
-        self._rtc_busy = False
-        self._rtc_loaded = time.time()
-        self.rtc.set_source(f"chart data failed: {err.splitlines()[0][:80]}")
-
-    def _rtc_tick(self):
-        if self.tabs.currentWidget() is self.rtc:
-            self.load_rt_chart()                   # no-op until the reload interval has passed
-        if not self.shoonya.live or not self._rtc_loaded:
-            return                                 # ticks always flow while live, so chart alerts fire on any tab
-        now = datetime.now(IST).replace(tzinfo=None)
-        for sym, _ in RT_SYMBOLS:
-            t = self.shoonya.tick(INDEX_TOKENS[sym])
-            if self.shoonya._fresh(t):
-                if t.get("c"):
-                    self.rtc.set_prev_close(sym, _num(t.get("c")))
-                self.rtc.push_tick(sym, _num(t.get("lp")), now)
-
-    def _chart_option_levels(self):
-        """OI walls / max pain for the chart, refreshed at most every 15 min per underlying,
-        without touching what the Options tab is showing."""
-        for und in ("NIFTY", "BANKNIFTY"):
-            hit = self._opt_ctx.get(und)
-            if (hit and time.time() - hit[0] < 900) or und in self._chart_opt_busy:
-                continue
-            self._chart_opt_busy.add(und)
-            task = Task(lambda _p, u=und: self._options_analysis(u, None))
-
-            def done(res, u=und):
-                self._chart_opt_busy.discard(u)
-                self._opt_ctx[u] = (time.time(), res)
-                self.rtc.set_option_levels(u, res)
-
-            task.signals.done.connect(done)
-            task.signals.failed.connect(lambda _e, u=und: self._chart_opt_busy.discard(u))
-            self._start(task)
-
-    def _chart_alert(self, msg: str):
-        self._status(f"⏰ Chart alert: {msg}")
-        QApplication.beep()
-        QApplication.alert(self)                   # bounce the dock icon / flash the taskbar
-
-    # ---------------------------------------------------------- trades & P&L
-    SETTLE_SYMBOL = {"NIFTY": "^NSEI", "BANKNIFTY": "NIFTY BANK", "FINNIFTY": "NIFTY FINANCIAL SERVICES",
-                     "MIDCPNIFTY": "NIFTY MIDCAP SELECT"}
-
-    def _trades_tick(self):
-        """Pull broker books while connected: every tick on the Trades tab, every
-        4th tick (~2 min) elsewhere so fills are stamped with context promptly."""
-        self._trades_ticks += 1
-        if not (self.shoonya.live and self.trades.auto.isChecked()):
-            return
-        if self.tabs.currentWidget() is self.trades or self._trades_ticks % 4 == 0:
-            self.sync_trades(pull=True)
-
-    def sync_trades(self, pull: bool):
-        if self._trades_busy:
-            self._trades_pending = bool(self._trades_pending) or pull
-            return
-        self._trades_busy, self._trades_pending = True, None
-        days = self.trades.period_days()
-        task = Task(lambda progress: self._trades_job(pull and self.shoonya.live, days))
-        task.signals.done.connect(self._trades_done)
-        task.signals.failed.connect(self._trades_failed)
-        self._start(task)
-
-    def _fill_ctx(self, f: dict) -> dict:
-        """Market read to stamp on a newly seen fill: the latest Options-tab
-        analysis for its underlying (computed now if older than 15 min)."""
-        und = f["und"]
-        if und not in UNDERLYINGS:
-            return {}
-        hit = self._opt_ctx.get(und)
-        if hit is None or time.time() - hit[0] > 900:
-            exp = pd.Timestamp(f["expiry"]).strftime("%d-%b-%Y") if f.get("expiry") is not None else None
-            try:
-                hit = self._opt_ctx[und] = (time.time(), self._options_analysis(und, exp))
-            except Exception as exc:
-                log.warning("Could not analyse %s for fill context: %s", und, exc)
-                return {}
-        return te.ctx_from_analysis(hit[1])
-
-    def _trades_job(self, pull: bool, days) -> dict:
-        svc, feed, store = self.svc, self.shoonya, self.svc.store
-        status = []
-        if pull:
-            tb, ob, pb, lim = feed.trade_book(), feed.order_book(), feed.position_book(), feed.limits()
-            fills = [f for f in (te.fill_from_shoonya(r) for r in tb) if f]
-            known = {d["fill_id"] for d in store.find_docs("broker_fills")}
-            for f in fills:
-                if f["fill_id"] not in known:
-                    f["ctx"] = self._fill_ctx(f)
-            store.upsert_docs("broker_fills", fills, insert_only=("ctx",))
-            today = datetime.combine(date.today(), datetime.min.time(), tzinfo=timezone.utc)
-            store.upsert_docs("broker_orders", [{**o, "order_no": str(o.get("norenordno", "")), "date": today}
-                                                for o in ob if o.get("norenordno")])
-            lim_d = self._limits(lim)
-            store.upsert_docs("pnl_daily", [{"date": today, "realised": sum(_num(r.get("rpnl")) for r in pb),
-                                             "mtm": sum(_num(r.get("urmtom")) for r in pb), **lim_d}])
-            feed.watch(f"{r.get('exch')}|{r.get('token')}" for r in pb)
-            self._last_book = {"positions": pb, "orders": ob, "limits": lim_d, "at": datetime.now()}
-            status.append(f"Synced with Shoonya at {datetime.now():%H:%M:%S} · {len(fills)} fills, "
-                          f"{len(ob)} orders, {len(pb)} positions today")
-        elif self._last_book:
-            status.append(f"Last Shoonya sync {self._last_book['at']:%H:%M:%S}")
-        else:
-            status.append("Showing stored trades — connect Shoonya to pull today's book")
-
-        if pull:
-            self._carry_forward(store, pb)
-        all_fills = store.find_docs("broker_fills", sort="time")
-        macro = svc.load_macro()
-        vix = macro["indiavix"] if "indiavix" in macro else None
-        dailies: dict[str, pd.DataFrame] = {}
-
-        def daily(und):
-            sym = self.SETTLE_SYMBOL.get(und)
-            if sym and sym not in dailies:
-                dailies[sym] = svc.load_ohlcv(sym, "1D")
-            return dailies.get(sym)
-
-        for f in all_fills:                                  # older / imported fills: reconstruct context
-            if not f.get("ctx"):
-                if f["fill_id"] not in self._ctx_cache:
-                    self._ctx_cache[f["fill_id"]] = te.reconstruct_ctx(f["und"], f["time"], daily(f["und"]), vix,
-                                                                         f.get("expiry"))
-                f["ctx"] = self._ctx_cache[f["fill_id"]]
-
-        def settle(und, d):
-            df = daily(und)
-            if df is None or df.empty:
-                return None
-            idx = df.index.tz_convert(config.IST).date if df.index.tz is not None else df.index.date
-            hit = df["close"][idx <= d]          # expiry close (or the last session before a holiday)
-            if not len(hit) or (d - idx[idx <= d][-1]).days > 4:
-                return None
-            return float(hit.iloc[-1])
-
-        closed, open_legs = te.round_trips(all_fills, settle)
-        strats = te.strategies(closed, open_legs)
-        if days is not None:
-            now = pd.Timestamp.now(tz=config.IST)
-            cut = (now.normalize() if days == 0 else
-                   pd.Timestamp(now.year, 1, 1, tz=config.IST) if days == -1 else now - pd.Timedelta(days=days))
-            strats = [s for s in strats if s["status"] == "open" or (s["exit_time"] or s["entry_time"]) >= cut]
-            fills_shown = [f for f in all_fills if pd.Timestamp(f["time"]).tz_convert(config.IST) >= cut]
-        else:
-            fills_shown = all_fills
-        book = self._last_book
-        lim = book.get("limits") or {}
-        capital = config.TRADING_CAPITAL or lim.get("available_total") or None
-        spot, sigma = {}, {}
-        for und in ("NIFTY", "BANKNIFTY"):
-            t = feed.tick(INDEX_TOKENS["^NSEI" if und == "NIFTY" else "NIFTY BANK"]) if feed.live else None
-            if t and t.get("lp"):
-                spot[und] = float(t["lp"])
-            elif und in self._opt_ctx:
-                spot[und] = self._opt_ctx[und][1].get("spot")
-            if und in self._opt_ctx:
-                sigma[und] = self._opt_ctx[und][1].get("sigma_move")
-        positions = te.manage_positions(book.get("positions") or [], spot, sigma)
-        orders = book.get("orders")
-        if orders is None:
-            today = datetime.combine(date.today(), datetime.min.time(), tzinfo=timezone.utc)
-            orders = [o for o in store.find_docs("broker_orders") if pd.Timestamp(o.get("date")) == pd.Timestamp(today)]
-        return {
-            "status": " · ".join(status), "positions": positions, "orders": orders,
-            "fills": list(reversed(fills_shown)), "strategies": strats, "metrics": te.metrics(strats),
-            "breakdowns": te.breakdowns(strats), "findings": te.diagnose(strats, capital),
-            "equity": te.equity_curve(strats), "limits": lim,
-            "today": {"open": sum(g["open_pnl"] for g in positions), "total": sum(g["mtm"] for g in positions)},
-            "journal": {d["strategy_id"]: d for d in store.find_docs("trade_journal")},
-            "explain": te._RULES,
-        }
-
-    @staticmethod
-    def _carry_forward(store, pb: list[dict]):
-        """Positions carried from earlier sessions have no fills in today's
-        TradeBook.  Record a 'carry-forward' opening fill at Shoonya's average
-        price for any carried quantity the stored fills don't explain, so the
-        position shows up in trade history when it is closed."""
-        start = pd.Timestamp.now(tz=config.IST).normalize()
-        stored = store.find_docs("broker_fills")
-        new = []
-        for r in pb:
-            cf = int(_num(r.get("cfbuyqty"))) - int(_num(r.get("cfsellqty")))
-            if not cf:
-                continue
-            tsym = r.get("tsym", "")
-            before = sum((f["qty"] if f["side"] == "B" else -f["qty"]) for f in stored
-                         if f["tsym"] == tsym and pd.Timestamp(f["time"]).tz_convert(config.IST) < start)
-            diff = cf - before
-            if not diff:
-                continue
-            side = "B" if diff > 0 else "S"
-            px = _num(r.get("cfbuyavgprc") if side == "B" else r.get("cfsellavgprc")) or _num(r.get("netavgprc"))
-            new.append({"fill_id": f"cf-{tsym}-{start.date()}", "order_no": "", "tsym": tsym,
-                        "time": (start + pd.Timedelta(hours=9)).to_pydatetime(), "exch": r.get("exch", ""),
-                        "token": str(r.get("token", "")), "side": side, "qty": abs(diff), "price": px,
-                        "lot": int(_num(r.get("ls")) or 1), "product": r.get("prd", ""), "source": "carry-forward",
-                        "ctx": {"source": "carry-forward", "first_seen": str(start.date())},
-                        **te._parsed(tsym)})
-        if new:
-            store.upsert_docs("broker_fills", new, insert_only=("ctx",))
-
-    @staticmethod
-    def _limits(lim: dict) -> dict:
-        """Shoonya Limits -> margin used / available (approximate: cash + pay-in +
-        collateral − margin used)."""
-        if not lim:
-            return {}
-        used = _num(lim.get("marginused"))
-        total = sum(_num(lim.get(k)) for k in ("cash", "payin", "brkcollamt", "collateral", "unclearedcash"))
-        return {"margin_used": used, "available_total": total, "available": total - used,
-                "cash": _num(lim.get("cash")), "premium": _num(lim.get("premium"))}
-
-    def _trades_done(self, d: dict):
-        self._trades_busy = False
-        self.trades.set_data(d)
-        self.ai.data_ready()
-        self.rtc.set_positions(d.get("positions") or [])         # my strikes on the chart
-        self._trades_next()
-
-    def _trades_failed(self, err: str):
-        self._trades_busy = False
-        self.trades.set_status(f"<span style='color:{C['down']}'>Trades sync failed: "
-                               f"{html.escape(err.splitlines()[0] if err else '')}</span>")
-        self._trades_next()
-
-    def _trades_next(self):
-        if self._trades_pending is not None:
-            pull = self._trades_pending
-            self._trades_pending = None
-            self.sync_trades(pull)
-
-    def import_trades(self, path: str):
-        try:
-            fills = te.fills_from_csv(pd.read_csv(path))
-        except Exception as exc:
-            QMessageBox.warning(self, "Import failed", str(exc))
-            return
-        n = self.svc.store.upsert_docs("broker_fills", fills, insert_only=("ctx",))
-        self.trades.set_status(f"Imported {len(fills)} fills ({n} new or updated) from {html.escape(path)}")
-        self.sync_trades(pull=False)
-
-    def save_journal(self, doc: dict):
-        self.svc.store.upsert_docs("trade_journal", [doc])
-        self.sync_trades(pull=False)
-
-    # ---------------------------------------------------------- Shoonya
-    def connect_shoonya(self):
-        if self.shoonya.live:
-            if QMessageBox.question(self, "Shoonya", "Disconnect from Shoonya real-time data?") \
-                    == QMessageBox.StandardButton.Yes:
-                self.shoonya.close()
-                self.rt_timer.stop()
-                self.opt_timer.setInterval(config.OPTIONS_REFRESH_SECONDS * 1000)
-                self._broker_label()
-            return
-        settings = load_settings()
-        if settings.get("access_token") and settings.get("token_date") == date.today().isoformat():
-            self._shoonya_run(settings, token=settings["access_token"], remember=True, reused=True)
-            return
-        self._shoonya_signin(settings)
-
-    def _shoonya_signin(self, settings: dict):
-        if from_env():                       # credentials come from .env: go straight to the browser
-            v, remember = {k: settings[k] for k in ("user_id", "client_id", "secret")}, True
-        else:
-            dlg = ShoonyaDialog(settings, REDIRECT_URL, self)
-            if dlg.exec() != ShoonyaDialog.DialogCode.Accepted:
-                return
-            v, remember = dlg.values(), dlg.remember.isChecked()
-        try:
-            catcher = OAuthCatcher()
-        except OSError as exc:
-            QMessageBox.warning(self, "Shoonya", f"Could not listen on {REDIRECT_URL} ({exc}). "
-                                "Close whatever uses that port, or paste the redirected address when asked.")
-            catcher = None
-        url = ShoonyaFeed.authorize_url(v)
-        QDesktopServices.openUrl(QUrl(url))
-        wait = ShoonyaWaitDialog(url, (lambda: catcher.code) if catcher else (lambda: None), self)
-        ok = wait.exec() == ShoonyaWaitDialog.DialogCode.Accepted
-        if catcher:
-            catcher.close()
-        if ok and wait.code:
-            self._shoonya_run(v, code=wait.code, remember=remember)
-
-    def _shoonya_run(self, settings: dict, token: str | None = None, code: str | None = None,
-                     remember: bool = True, reused: bool = False):
-        self.broker_btn.setEnabled(False)
-        self._broker_label()
-        for b in (self.broker_btn, self.opts.broker, self.live.broker):
-            b.setText("… Shoonya: connecting")
-        feed = self.shoonya
-
-        def job(progress):
-            tok = token or feed.exchange_code(settings, code)
-            msg = feed.connect(settings, tok)
-            return {"msg": msg, "token": tok, "settings": settings, "remember": remember}
-
-        task = Task(job)
-        task.signals.done.connect(self._shoonya_done)
-        task.signals.failed.connect(lambda err: self._shoonya_failed(err, settings if reused else None))
-        self._start(task)
-
-    def _shoonya_done(self, out: dict):
-        if out["remember"]:
-            save_settings(out["settings"], out["token"])
-        self.broker_btn.setEnabled(True)
-        self._status(f"Shoonya: {out['msg']} — real-time data on")
-        self.rt_timer.start()
-        self.opt_timer.setInterval(5000)          # option chain from live ticks: refresh often
-        self._broker_label()
-        if self.tabs.currentWidget() is self.opts:
-            self.opts.request()
-        self.sync_trades(pull=True)
-        self.load_rt_chart(force=True)            # re-seed the intraday chart from real-time candles
-
-    def _shoonya_failed(self, err: str, retry_settings: dict | None = None):
-        self.broker_btn.setEnabled(True)
-        self._broker_label()
-        if retry_settings is not None:            # today's saved session no longer works: sign in again
-            self._shoonya_signin(retry_settings)
-            return
-        QMessageBox.warning(self, "Shoonya connection failed", err.split("\n\n")[0])
-
-    def closeEvent(self, event):
-        self.shoonya.close()
-        super().closeEvent(event)
-
-    def _broker_label(self):
-        f = self.shoonya
-        if f.live:
-            text, head, style = "● Shoonya: real-time", "● Shoonya live — disconnect", f"color:{C['up']}"
-        elif f.logged_in:
-            text = head = f"◐ Shoonya: {f.status}"
-            style = "color:#f59e0b"
-        else:
-            text, head, style = "○ Shoonya: connect for real-time", "Connect Shoonya (real-time)", ""
-        self.broker_btn.setText(text)
-        for b in (self.broker_btn, self.opts.broker, self.live.broker):
-            b.setStyleSheet(style)
-            b.setEnabled(self.broker_btn.isEnabled())
-        self.rtc.broker.setText(head)
-        self.rtc.broker.setStyleSheet(style)
-        self.opts.broker.setText(head)
-        self.live.broker.setText(head)
-        self.trades.connect_btn.setText(head)
-        self.trades.connect_btn.setStyleSheet(style)
-
-    def _live_failed(self, err: str):
-        self._live_busy = False
-        log.warning("Live poll failed: %s", err.splitlines()[0])
-        self.live.ts.setText("Live poll failed — retrying")
-
     def compute_levels(self, force: bool = False):
-        """Load stored daily levels for the live tiles; analyse any index that has
-        none yet (or all of them when `force`)."""
+        """Stored daily levels for the live tiles; analyse any index that has none yet
+        (or all of them when `force`)."""
         svc = self.svc
 
         def job(progress):
@@ -963,7 +644,6 @@ class MainWindow(QMainWindow):
             last = fii.dropna(subset=["fii_cash_net"]).iloc[-1] if "fii_cash_net" in fii else None
             flows = (None if last is None else
                      (last.get("fii_cash_net"), last.get("dii_cash_net"), f"{last.name:%d-%b}"))
-            # Last CHART_DAYS daily bars per index for the live mini charts.
             history = {}
             for sym in config.INDEX_SYMBOLS:
                 d = svc.load_ohlcv(sym, "1D")
@@ -974,12 +654,7 @@ class MainWindow(QMainWindow):
             return svc.latest_levels(config.INDEX_SYMBOLS), flows, history
 
         self.live.lvl_btn.setEnabled(False)
-        self.live.sync_btn.setEnabled(False)
-        task = Task(job)
-        task.signals.progress.connect(self._status)
-        task.signals.done.connect(self._levels_done)
-        task.signals.failed.connect(self._levels_failed)
-        self._start(task)
+        self.runner.start(job, self._levels_done, self._levels_failed, self._status)
 
     def _levels_done(self, payload):
         levels, flows, history = payload
@@ -989,27 +664,272 @@ class MainWindow(QMainWindow):
         if flows:
             self.live.set_flows(*flows)
         self.live.lvl_btn.setEnabled(True)
-        self.live.sync_btn.setEnabled(True)
         self._status(f"Live levels ready for {len(levels)}/{len(config.INDEX_SYMBOLS)} indices")
 
     def _levels_failed(self, err: str):
         self.live.lvl_btn.setEnabled(True)
-        self.live.sync_btn.setEnabled(True)
         self._failed(err)
 
-    def _start(self, task: Task):
-        self._tasks.add(task)
-        for sig in (task.signals.done, task.signals.failed):
-            sig.connect(lambda *_a, t=task: self._tasks.discard(t))
-        self.pool.start(task)
-
     def open_symbol(self, sym: str):
-        self.tabs.setCurrentWidget(self.web)
+        self.show_page("analysis")
         idx = self.sym.findData(sym)
         if idx == self.sym.currentIndex():
             self.run_analysis()
         else:
             self.sym.setCurrentIndex(idx)
+
+    # ================================================================== intraday chart
+    RT_RELOAD_LIVE, RT_RELOAD_DELAYED = 120, 30
+
+    def load_rt_chart(self, force: bool = False):
+        every = self.RT_RELOAD_LIVE if self.broker.live else self.RT_RELOAD_DELAYED
+        if self._flags["rtc"] or (not force and time.time() - self._rtc_loaded < every):
+            return
+        self._flags["rtc"] = True
+        market, svc = self.market, self.svc
+
+        def job(_p):
+            data, src = market.candles_1m([s for s, _ in RT_SYMBOLS])
+            daily = {}
+            for sym, _ in RT_SYMBOLS:
+                try:
+                    daily[sym] = svc.load_ohlcv(sym, "1D")
+                except Exception as exc:
+                    log.warning("daily bars for chart: %s", exc)
+            return data, src, daily
+
+        def failed(err):
+            self._flags["rtc"] = False
+            self._rtc_loaded = time.time()
+            self.rtc.set_source(f"chart data failed: {err.splitlines()[0][:80]}")
+
+        self.runner.start(job, self._rtc_done, failed)
+
+    def _rtc_done(self, payload):
+        data, src, daily = payload
+        self._flags["rtc"] = False
+        self._rtc_loaded = time.time()
+        for sym, df in daily.items():
+            self.rtc.set_daily(sym, df)
+        snap = self._last_snap or {}
+        for sym, _ in RT_SYMBOLS:
+            self.rtc.set_prev_close(sym, ((snap.get("quotes") or {}).get(sym) or {}).get("prev"))
+        self.rtc.set_history(data, src)
+        if self.current_page() != "intraday":
+            self._rtc_need_fit = True               # drawn while hidden: re-fit when first shown
+
+    def _rtc_tick(self):
+        if not self._rtc_loaded:
+            return                                 # ticks flow on every page so chart alerts fire anywhere
+        now = datetime.now(IST).replace(tzinfo=None)
+        feed = self.broker.feed
+        for sym, _ in RT_SYMBOLS:
+            t = feed.tick(INDEX_TOKENS[sym])
+            if feed._fresh(t):
+                if t.get("c"):
+                    self.rtc.set_prev_close(sym, _num(t.get("c")))
+                self.rtc.push_tick(sym, _num(t.get("lp")), now)
+
+    def _chart_alert(self, msg: str):
+        self._status(f"⏰ Chart alert: {msg}")
+        QApplication.beep()
+        QApplication.alert(self)
+
+    # ================================================================== option chain
+    def load_options(self, underlying: str, expiry: str):
+        self._once("opt", self.options.analyse, self._options_done, self._options_failed, underlying, expiry)
+
+    def _options_done(self, res: dict):
+        self.opts.set_result(res)
+        self._chain_result(res)
+
+    def _options_failed(self, err: str):
+        self.opts.set_error(err.splitlines()[0] if err else "unknown error")
+
+    def _chain_result(self, res: dict):
+        """Every fresh chain analysis feeds the chart levels and the FII/DII strike zones."""
+        self.rtc.set_option_levels(res["underlying"], res)
+        self.fii_view.set_zone_results({res["underlying"]: res})
+
+    def _chains_due(self, force: bool = False):
+        """Analyse both underlyings in the background (stores snapshots); refresh
+        the chart levels and FII/DII zones without touching the chain screen."""
+        for und in ("NIFTY", "BANKNIFTY"):
+            res = self.options.fresh(und, 300 if not force else 60)
+            if res:
+                self._chain_result(res)
+                continue
+            key = f"chain_{und}"
+            if self._flags.get(key):
+                continue
+            self._flags[key] = True
+
+            def done(r, k=key):
+                self._flags[k] = False
+                self._chain_result(r)
+
+            def failed(e, k=key):
+                self._flags[k] = False
+                log.warning("Background chain failed: %s", e.splitlines()[0])
+
+            self.runner.start(lambda _p, u=und: self.options.analyse(u, None), done, failed)
+
+    # ================================================================== FII / DII
+    def load_fii(self):
+        svc = self.svc
+
+        def job(_p):
+            return fii_analysis.analyse(svc.load_fii_dii(), svc.load_ohlcv("^NSEI", "1D"))
+
+        self.runner.start(job, self._fii_done, lambda e: log.warning("FII analysis failed: %s", e.splitlines()[0]))
+
+    def _fii_done(self, res: dict):
+        self.fii_view.set_result(res)
+        if res.get("available"):
+            self._status(f"FII/DII read {res['bias']} ({res['score']:+.0f}) as of {res['as_of']:%d %b}")
+
+    def _fii_brief(self) -> dict:
+        """Compact FII/DII read for the AI coach."""
+        r = self.fii_view.res or {}
+        if not r.get("available"):
+            return {}
+        return {"as_of": f"{r['as_of']:%Y-%m-%d}", "score": round(r["score"]), "bias": r["bias"],
+                "conviction": r["conviction"], "writing_side": r["playbook"]["side"],
+                "signals": {c["label"]: f"{c['value']} ({c['reading']}, score {c['score']:+.1f})"
+                            for c in r["components"]},
+                "warnings": r["warnings"]}
+
+    def import_csv(self):
+        path, _ = QFileDialog.getOpenFileName(self, "FII/DII history CSV", str(Path.home()), "CSV (*.csv)")
+        if path:
+            self._import_fii_path(path)
+
+    def _import_fii_path(self, path: str):
+        try:
+            n = self.svc.store.upsert_fii_dii(import_fii_dii_csv(path))
+            self._status(f"Imported {n} FII/DII rows")
+            self.load_fii()
+            self.run_analysis()
+        except Exception as exc:
+            QMessageBox.warning(self, "Import failed", str(exc))
+
+    # ================================================================== trades
+    def _trades_tick(self):
+        """Pull broker books while connected: every tick on the Trades page, every
+        4th tick (~2 min) elsewhere so fills are stamped with context promptly."""
+        self._trades_ticks += 1
+        if not (self.broker.live and self.trades.auto.isChecked()):
+            return
+        if self.current_page() == "trades" or self._trades_ticks % 4 == 0:
+            self.sync_trades(pull=True)
+
+    def sync_trades(self, pull: bool):
+        if self._flags["trades"]:
+            self._pending["trades"] = (bool((self._pending.get("trades") or (False,))[0]) or pull,)
+            return
+        self._once("trades", lambda p, d: self.trades_svc.refresh(p, d), self._trades_done, self._trades_failed,
+                   pull, self.trades.period_days())
+
+    def _trades_done(self, d: dict):
+        self.trades.set_data(d)
+        self.ai.data_ready()
+        self.rtc.set_positions(d.get("positions") or [])
+
+    def _trades_failed(self, err: str):
+        self.trades.set_status(f"<span style='color:{C['down']}'>Trades sync failed: "
+                               f"{html.escape(err.splitlines()[0] if err else '')}</span>")
+
+    def import_trades(self, path: str):
+        try:
+            total, n = self.trades_svc.import_csv(path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Import failed", str(exc))
+            return
+        self.trades.set_status(f"Imported {total} fills ({n} new or updated) from {html.escape(path)}")
+        self.sync_trades(pull=False)
+
+    def save_journal(self, doc: dict):
+        self.svc.store.upsert_docs("trade_journal", [doc])
+        self.sync_trades(pull=False)
+
+    # ================================================================== sync
+    def sync(self):
+        self.sync_svc.run_eod()
+
+    def _eod_done(self, summary: dict):
+        errs = summary.get("errors") or []
+        cash = summary.get("fii_cash") or {}
+        msg = (f"Synced · OI days +{summary.get('participant_oi_days', 0)}"
+               f" · cash days {summary.get('fii_cash_days', 0)}"
+               + (f" · FII {cash.get('fii_cash_net', 0):+,.0f} / DII {cash.get('dii_cash_net', 0):+,.0f} cr "
+                  f"({pd.Timestamp(cash['date']):%d-%b})" if cash else ""))
+        if errs:
+            msg += f" · {len(errs)} warning(s)"
+            log.warning("Sync warnings: %s", errs)
+        self._status(msg)
+        self.run_analysis()
+        self.compute_levels()
+        self.load_fii()
+
+    # ================================================================== index analysis
+    def _busy(self, busy: bool, msg: str = ""):
+        for w in (self.refresh_btn, self.sym, self.scan_btn, *self.tf_group.buttons()):
+            w.setEnabled(not busy)
+        if not busy:
+            intraday = config.supports_intraday(self.sym.currentData()) or bool(self.shoonya.key_for(self.sym.currentData()))
+            for b in self.tf_group.buttons():
+                b.setEnabled(b.text() == "1D" or intraday)
+        self._status(msg)
+
+    def current(self) -> tuple[str, str]:
+        symbol = self.sym.currentData()
+        ok_intraday = config.supports_intraday(symbol) or bool(self.shoonya.key_for(symbol))
+        if not ok_intraday and self.tf_group.checkedButton().text() != "1D":
+            self.tf_group.buttons()[0].setChecked(True)
+        return symbol, self.tf_group.checkedButton().text()
+
+    def run_analysis(self):
+        symbol, tf = self.current()
+        self._busy(True, f"Analysing {symbol} {tf}…")
+        svc, market = self.svc, self.market
+
+        def job(progress):
+            src = None
+            if tf != "1D" or market.shoonya_key(symbol):
+                for t in ({tf, "1H"} if tf != "1D" else {"1H"}):     # 1H also builds today's live daily bar
+                    last = svc.store.latest_timestamp(symbol, t)
+                    stale = last is None or (pd.Timestamp.now(tz="UTC") - pd.Timestamp(last)).total_seconds() > 6 * 3600
+                    if market.shoonya_key(symbol) or stale:
+                        s = market.refresh_intraday(symbol, t)
+                        src = src or (s if t == tf else None)
+            daily = svc.load_ohlcv(symbol, "1D")
+            frame = daily if tf == "1D" else svc.store.load_ohlcv(symbol, tf)
+            if frame is None or frame.empty:
+                raise RuntimeError(f"No {tf} candles stored for {symbol} yet — connect Shoonya (it streams this "
+                                   "instrument) or pick 1D.")
+            fii, macro = svc.load_fii_dii(), svc.load_macro()
+            res = analyze(symbol, tf, frame, daily, fii, macro)
+            svc.save_sr_levels(to_sr_document(res))
+            res["pair"] = pair_ratio(svc, symbol, daily)
+            res["data_source"] = src or ("NSE archive" if tf == "1D" else "stored")
+            return res, fii
+
+        self.runner.start(job, self._analysis_done, self._failed)
+
+    def _failed(self, err: str):
+        self._busy(False, "Error — see details")
+        QMessageBox.warning(self, "Operation failed", err)
+
+    def _analysis_done(self, payload):
+        self.result, self.fii = payload
+        self.render_chart()
+        self.render_panel()
+        r = self.result
+        src = {"shoonya": "Shoonya real-time candles", "yahoo": "Yahoo candles", "offline": "stored candles (offline)"}
+        self.src_lbl.setText(f"<span style='font-size:11px'>Data: {src.get(r.get('data_source'), r.get('data_source'))}"
+                             "</span>")
+        self._busy(False, f"{r['symbol']} {r['timeframe']} as of "
+                          f"{pd.Timestamp(r['as_of']).tz_convert(config.IST):%d-%b-%Y %H:%M} IST")
 
     # ---------------------------------------------------------- sidebar
     def _build_sidebar(self) -> QFrame:
@@ -1019,11 +939,6 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(side)
         lay.setContentsMargins(14, 16, 14, 14)
         lay.setSpacing(10)
-        t = QLabel("NSE QUANT TERMINAL")
-        t.setProperty("class", "h1")
-        lay.addWidget(t)
-        lay.addWidget(wrap_label("Buy on dips · Sell on rallies", "muted"))
-
         lay.addWidget(self._h2("Instrument"))
         self.sym = QComboBox()
         self.sym.setMaxVisibleItems(32)
@@ -1064,22 +979,13 @@ class MainWindow(QMainWindow):
             lay.addWidget(cb)
 
         lay.addSpacing(8)
-        self.sync_btn = QPushButton("⟳  Sync Latest EOD Data", objectName="primary")
-        self.sync_btn.clicked.connect(self.sync)
-        lay.addWidget(self.sync_btn)
-        self.sync_all = QCheckBox("Sync all indices && ETFs")
-        self.sync_all.setChecked(True)
-        lay.addWidget(self.sync_all)
-        self.refresh_btn = QPushButton("Re-run analysis")
+        self.refresh_btn = QPushButton("Re-run analysis", objectName="primary")
         self.refresh_btn.clicked.connect(self.run_analysis)
         lay.addWidget(self.refresh_btn)
-        imp = QPushButton("Import FII/DII history (CSV)…")
-        imp.clicked.connect(self.import_csv)
-        lay.addWidget(imp)
+        self.src_lbl = wrap_label("", "muted")
+        lay.addWidget(self.src_lbl)
 
         lay.addStretch(1)
-        self.db_lbl = wrap_label("", "muted")
-        lay.addWidget(self.db_lbl)
         self.status_lbl = wrap_label("", "muted")
         lay.addWidget(self.status_lbl)
         lay.addWidget(wrap_label("<span style='font-size:10px'>Educational analytics only — "
@@ -1265,93 +1171,6 @@ class MainWindow(QMainWindow):
 
     def _open_from_scan(self, row: int, _col: int):
         self.open_symbol(self.scan_table.item(row, 0).data(Qt.ItemDataRole.UserRole + 1))
-
-    # ---------------------------------------------------------- actions
-    def _busy(self, busy: bool, msg: str = ""):
-        for w in (self.sync_btn, self.live.sync_btn, self.refresh_btn, self.sym, self.scan_btn,
-                  *self.tf_group.buttons()):
-            w.setEnabled(not busy)
-        if not busy:   # indices without a Yahoo feed have daily data only
-            intraday = config.supports_intraday(self.sym.currentData())
-            for b in self.tf_group.buttons():
-                b.setEnabled(b.text() == "1D" or intraday)
-        self._status(msg)
-
-    def _status(self, msg: str):
-        self.status_lbl.setText(msg)
-        self.statusBar().showMessage(msg)
-
-    def current(self) -> tuple[str, str]:
-        symbol = self.sym.currentData()
-        if not config.supports_intraday(symbol) and self.tf_group.checkedButton().text() != "1D":
-            self.tf_group.buttons()[0].setChecked(True)
-        return symbol, self.tf_group.checkedButton().text()
-
-    def sync(self):
-        self._busy(True, "Syncing…")
-        symbol = self.sym.currentData()
-        symbols = None if self.sync_all.isChecked() else [s for s in (symbol, config.pair_of(symbol)) if s]
-        task = Task(lambda p: self.svc.sync(symbols=symbols, progress=p))
-        task.signals.progress.connect(self._status)
-        task.signals.done.connect(self._sync_done)
-        task.signals.failed.connect(self._failed)
-        self._start(task)
-
-    def _sync_done(self, summary: dict):
-        errs = summary.get("errors") or []
-        cash = summary.get("fii_cash") or {}
-        msg = (f"Synced · OI days +{summary.get('participant_oi_days', 0)}"
-               f" · cash days {summary.get('fii_cash_days', 0)}"
-               + (f" · FII {cash.get('fii_cash_net', 0):+,.0f} / DII {cash.get('dii_cash_net', 0):+,.0f} cr "
-                  f"({pd.Timestamp(cash['date']):%d-%b})" if cash else ""))
-        if errs:
-            msg += f" · {len(errs)} warning(s)"
-            log.warning("Sync warnings: %s", errs)
-        self._busy(False, msg)
-        self.run_analysis()
-        self.compute_levels()   # refresh live tiles' charts, zones and EOD signals
-
-    def run_analysis(self):
-        symbol, tf = self.current()
-        self._busy(True, f"Analysing {symbol} {tf}…")
-        svc = self.svc
-
-        def job(progress):
-            daily = svc.load_ohlcv(symbol, "1D")
-            frame = daily if tf == "1D" else svc.load_ohlcv(symbol, tf)
-            fii, macro = svc.load_fii_dii(), svc.load_macro()
-            res = analyze(symbol, tf, frame, daily, fii, macro)
-            svc.save_sr_levels(to_sr_document(res))
-            res["pair"] = pair_ratio(svc, symbol, daily)
-            return res, fii
-
-        task = Task(job)
-        task.signals.done.connect(self._analysis_done)
-        task.signals.failed.connect(self._failed)
-        self._start(task)
-
-    def _failed(self, err: str):
-        self._busy(False, "Error — see details")
-        QMessageBox.warning(self, "Operation failed", err)
-
-    def _analysis_done(self, payload):
-        self.result, self.fii = payload
-        self.render_chart()
-        self.render_panel()
-        r = self.result
-        self._busy(False, f"{r['symbol']} {r['timeframe']} as of "
-                          f"{pd.Timestamp(r['as_of']).tz_convert(config.IST):%d-%b-%Y %H:%M} IST")
-
-    def import_csv(self):
-        path, _ = QFileDialog.getOpenFileName(self, "FII/DII history CSV", str(Path.home()), "CSV (*.csv)")
-        if not path:
-            return
-        try:
-            n = self.svc.store.upsert_fii_dii(import_fii_dii_csv(path))
-            self._status(f"Imported {n} FII/DII rows")
-            self.run_analysis()
-        except Exception as exc:
-            QMessageBox.warning(self, "Import failed", str(exc))
 
     # ---------------------------------------------------------- rendering
     def render_chart(self):

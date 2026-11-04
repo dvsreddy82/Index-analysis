@@ -33,7 +33,8 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QFileDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
 import config
-from live_view import C, key_zones
+from live_view import key_zones
+from theme import C
 
 log = logging.getLogger(__name__)
 
@@ -122,7 +123,6 @@ class _Page(QWebEnginePage):
 
 class RealtimeCharts(QWidget):
     reload_requested = Signal()
-    broker_requested = Signal()
     alert_fired = Signal(str)
 
     def __init__(self):
@@ -154,10 +154,7 @@ class RealtimeCharts(QWidget):
         hl.addWidget(self.source)
         reload_btn = QPushButton("Reload")
         reload_btn.clicked.connect(self.reload_requested.emit)
-        self.broker = QPushButton("Connect Shoonya (real-time)")
-        self.broker.clicked.connect(self.broker_requested.emit)
         hl.addWidget(reload_btn)
-        hl.addWidget(self.broker)
         lay.addWidget(bar)
 
         self.view = QWebEngineView()
@@ -298,6 +295,10 @@ class RealtimeCharts(QWidget):
             self._sent_len[sym] = len(s.bars)
             self._call("tick", sym, [_epoch(m), b[1], b[2], b[3], b[4]])
         return True
+
+    def refit(self):
+        """Re-apply the default view (after data arrived while the page was hidden)."""
+        self._call("refit")
 
     def render(self):
         """Ticks are pushed as they arrive; kept for API compatibility."""

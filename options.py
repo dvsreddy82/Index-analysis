@@ -212,6 +212,7 @@ def build_chain(df: pd.DataFrame, S: float, T: float, step: float, mp: float, lo
         row = {"strike": k, "pcr": (r.pe_oi / r.ce_oi) if r.ce_oi else None}
         for p, kind in (("ce", "CE"), ("pe", "PE")):
             iv = r[f"{p}_iv"]
+            iv = None if iv is None or pd.isna(iv) or iv <= 0 else float(iv)     # no solvable IV (deep ITM)
             g = bs_greeks(S, k, T, iv, kind) if iv else {}
             ltp, chg = float(r[f"{p}_ltp"]), float(r[f"{p}_px_chg"])
             prev = ltp - chg

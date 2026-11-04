@@ -39,7 +39,7 @@ SCHEMAS: dict[str, dict] = {
         "required": ["symbol", "timeframe", "timestamp", "open", "high", "low", "close"],
         "properties": {
             "symbol": {"bsonType": "string"},
-            "timeframe": {"enum": list(config.TIMEFRAMES)},
+            "timeframe": {"enum": config.STORED_TIMEFRAMES},
             "timestamp": {"bsonType": "date"},
             "open": _NUM, "high": _NUM, "low": _NUM, "close": _NUM, "volume": _NUM,
         },
@@ -133,7 +133,9 @@ class DBHandler:
         self.macro: Collection = self.db["macro_series"]
         # broker / trade journal (see trades_engine.py); key fields per collection
         self.journal_keys = {"broker_fills": ("fill_id",), "broker_orders": ("order_no", "date"),
-                             "pnl_daily": ("date",), "trade_journal": ("strategy_id",), "ai_reviews": ("review_id",)}
+                             "pnl_daily": ("date",), "trade_journal": ("strategy_id",), "ai_reviews": ("review_id",),
+                             "option_chain_snapshots": ("underlying", "expiry", "ts"), "sync_log": ("job",),
+                             "broker_positions": ("date",)}
         self.ensure_schema()
 
     # ------------------------------------------------------------ setup
@@ -165,6 +167,8 @@ class DBHandler:
         for name, keys in self.journal_keys.items():
             self.db[name].create_index([(k, ASCENDING) for k in keys], unique=True, name="_".join(keys) + "_unique")
         self.db["broker_fills"].create_index([("time", DESCENDING)], name="time")
+        self.db["option_chain_snapshots"].create_index([("underlying", ASCENDING), ("ts", DESCENDING)],
+                                                       name="underlying_ts")
 
     def close(self) -> None:
         self.client.close()
@@ -301,10 +305,13 @@ def _upsert_docs(self, name: str, docs: list[dict], insert_only: tuple[str, ...]
     return self._bulk_upsert(self.db[name], ops)
 
 
-def _find_docs(self, name: str, query: dict | None = None, sort: str | None = None) -> list[dict]:
+def _find_docs(self, name: str, query: dict | None = None, sort: str | None = None,
+               desc: bool = False, limit: int | None = None) -> list[dict]:
     cur = self.db[name].find(query or {}, {"_id": 0})
     if sort:
-        cur = cur.sort(sort, ASCENDING)
+        cur = cur.sort(sort, DESCENDING if desc else ASCENDING)
+    if limit:
+        cur = cur.limit(limit)
     return list(cur)
 
 

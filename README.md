@@ -45,7 +45,9 @@ plus the ETFs that track them.
 | Sectoral | NIFTY Consumer Durables | — | ✓ |
 | Sectoral | NIFTY Chemicals | GROWWCHEM | ✓ |
 
-* **Where the data comes from:** daily OHLCV for every index except NIFTY 50 comes from NSE's official EOD archive (`ind_close_all_DDMMYYYY.csv`). One file per day covers all the indices, so the first sync back-fills about 2 years in roughly 30 seconds. Yahoo's daily history for most of these indices is missing or cut short. Intraday bars and all ETF prices come from Yahoo.
+* **Where the data comes from:**
+  * **Daily OHLCV:** for every index except NIFTY 50 it comes from NSE's official EOD archive (`ind_close_all_DDMMYYYY.csv`). One file per day covers all the indices, so the first sync back-fills about 2 years in roughly 30 seconds. Yahoo's daily history for most of these indices is missing or cut short.
+  * **Intraday bars and ETF prices:** from Shoonya when connected, for every instrument it streams (see *Where Shoonya is used*); from Yahoo otherwise. With Shoonya, "daily only" indices such as Midcap Select also get 1H and 15m charts.
 * **Today's bar:** NSE publishes the archive after the close. Until then, today's daily bar is built from the stored 1H candles. The two daily-only indices show the previous close until the evening sync.
 * **ETF mapping:** I checked each ETF's fund name on Yahoo before mapping it. Indices without a liquid tracking ETF are analysed as index-only, and the card shows "No tracking ETF mapped". To add one, set `etf=` in `config._INDICES` and add the ETF's name to `_ETF_NAMES`.
 * **FII/DII data is market-wide** and comes mostly from NIFTY index futures and options. It is a useful sentiment backdrop for mid and small caps, but it says less about them than about NIFTY 50.
@@ -57,61 +59,93 @@ plus the ETFs that track them.
 
 ## 1. Architecture
 
+### Screens
+A left navigation rail groups the eight screens. **Ctrl+1 … Ctrl+8** jumps straight to each one.
+
+| Group | Screen | What it is for |
+|---|---|---|
+| Markets | **Live overview** | Every index and ETF on one screen: live price, change, key levels, EOD signal |
+| Markets | **Intraday chart** | NIFTY 50 / BANKNIFTY TradingView-style candles, indicators, levels, drawings, alerts |
+| Markets | **Option chain** | NIFTY / BANKNIFTY chain, OI and IV charts, option-selling analysis |
+| Markets | **FII / DII flows** | Institutional positioning → option-writing direction and strike zones |
+| Research | **Index analysis** | Zones, pivots, volume profile and decision card for any index or ETF |
+| Research | **Scanner** | Daily analysis of all 56 instruments in one table |
+| My trading | **Trades & P&L** | Positions, orders, fills, history, performance, "why I lost", journal |
+| My trading | **AI coach** | Chat with a local LLM about your trades |
+
+Each screen starts the same way: a title, a one-line purpose, then a toolbar for that screen's own controls. One **app bar** at the top is shared by all of them:
+* market open/closed and the IST clock;
+* the data source (real-time or NSE delayed);
+* FII/DII and EOD freshness;
+* MongoDB status;
+* **Sync ▾** (sync everything, check FII/DII, back-fill intraday, import CSV);
+* **the only Shoonya button**.
+
+### Services (no screen talks to a data source directly)
 ```
-                 ┌──────────────────────── External sources ─────────────────────────┐
-                 │ Yahoo Finance (yfinance)            NSE (nseindia / nsearchives)  │
-                 │  ^NSEI, NIFTYBEES.NS 1D/1H/15m       fiidiiTradeReact  (cash)     │
-                 │  Brent, USD/INR, US10Y, VIX, DXY     fao_participant_oi_*.csv     │
-                 └───────────────┬──────────────────────────────┬────────────────────┘
-                                 │                              │
-                        ┌────────▼──────────────────────────────▼────────┐
-                        │ data_fetcher.py                                 │
-                        │  fetch_ohlcv · fetch_macro · NSEClient          │
-                        │  (session warm-up, retries, CSV parsing)        │
-                        │  DataService.sync()  ← "Sync Latest EOD Data"   │
-                        └────────┬───────────────────────────────▲────────┘
-                       upserts   │                               │ loads
-                        ┌────────▼───────────────────────────────┴────────┐
-                        │ db_handler.py  →  MongoDB `nse_analytics`       │
-                        │  index_ohlcv · fii_dii_activity · sr_levels     │
-                        │  macro_series   (validators + unique indexes)   │
-                        │  MemoryStore fallback when Mongo is down        │
-                        └────────┬────────────────────────────────────────┘
-                                 │ DataFrames
-                        ┌────────▼────────────────────────────────────────┐
-                        │ indicators.py  (pure pandas/numpy, no I/O)      │
-                        │  EMA/RSI/ATR/ADX → Pivots (Std/Fib/Cam, M & W)  │
-                        │  Volume Profile (POC/VAH/VAL/HVN) → Swings      │
-                        │  → Zone clustering + touch counts               │
-                        │  Institutional thesis · Catalyst attribution    │
-                        │  Projection (±1σ snapped to zones) · Signal     │
-                        └────────┬────────────────────────────────────────┘
-                                 │ result dict  (+ saved to sr_levels)
-                        ┌────────▼────────────────────────────────────────┐
-                        │ app.py  (PySide6, QThreadPool workers)          │
-                        │  Sidebar │ Plotly chart in QWebEngineView │ Cards│
-                        └─────────────────────────────────────────────────┘
+ Shoonya (read-only)      NSE (nseindia / nsearchives)      Yahoo        NiftyTrader / Moneycontrol
+        │                         │                            │                    │
+  broker.Broker  ── one ShoonyaFeed, OAuth sign-in, today's session reused at start-up, state signal
+        │
+  market_data.MarketData ── candles & quotes: Shoonya first, then NSE / Yahoo; every pull upserted to MongoDB
+  options_service        ── option chain: Shoonya → NSE → last stored snapshot (offline); snapshots every 5 min
+  trades_service         ── broker books → MongoDB → round trips, strategies, diagnosis
+  sync_service           ── scheduler: FII/DII as NSE publishes, daily EOD, intraday candles, chain snapshots
+  fii_analysis           ── FII/DII positioning score → option-writing posture, strike zones, track record
+        │
+  db_handler.DBHandler → MongoDB `nse_analytics`   (MemoryStore fallback when MongoDB is down)
+        │
+  app.py (shell: app bar, navigation, wiring)  +  one *_view.py per screen
 ```
+
+### Where Shoonya is used
+Shoonya is used for everything it provides; the public sources fill the rest:
+* **Live quotes:**
+  * Shoonya ticks for the six indices it streams (NIFTY 50, BANKNIFTY, Next 50, Fin Service, Midcap Select, India VIX) and every tracking ETF. That's 27 instruments.
+  * The other ~28 indices come from NSE's snapshot, polled every 15 s, because Shoonya has no feed for them. Token range 26000–26400 was checked.
+* **Intraday candles:** Shoonya TPSeries for the same instruments: 1m (≈30 days), 15m (≈60 days) and 1H (≈6 months), with volume for ETFs. Yahoo is used only for instruments Shoonya doesn't stream, or while Shoonya isn't connected.
+* **Option chains:** real-time from Shoonya. NSE's snapshot is the fallback.
+* **Positions, orders, fills and margin:** Shoonya, read-only.
+* **Daily OHLCV, FII/DII and macro data:** not offered by Shoonya, so they come from NSE's archive, NSE/NiftyTrader/Moneycontrol and Yahoo.
+
+### Offline use
+Everything is stored in MongoDB as it arrives, so the screens keep working without a connection:
+* **Intraday chart:** reads stored 1-minute candles.
+* **Option chain:** opens the last stored snapshot, marked "Offline".
+* **Trades & P&L:** shows the last synced position book.
+* **FII/DII and Index analysis:** run entirely on stored data.
 
 | File | Responsibility |
 |---|---|
+| `app.py` | Shell: app bar, navigation rail, pages, wiring services to screens |
+| `theme.py` | Colour tokens, stylesheet, page header / card / toolbar building blocks |
+| `tasks.py` | Background tasks on the Qt thread pool |
+| `broker.py` | The single Shoonya connection, sign-in dialogs, connection state |
+| `shoonya_feed.py` | Read-only Shoonya REST + websocket client |
+| `market_data.py` | Shoonya-first candles / quotes, option-chain snapshots, MongoDB persistence |
+| `options_service.py` / `options.py` | Option-chain analysis service / maths (IV, Greeks, structures, per-strike chain) |
+| `trades_service.py` / `trades_engine.py` | Broker-book sync / journal analytics |
+| `sync_service.py` | Background scheduler and `sync_log` |
+| `fii_analysis.py` / `fii_view.py` | FII/DII positioning engine / screen |
 | `config.py` | All tunables (Mongo URI, symbols, thresholds); each can be overridden by an environment variable |
-| `db_handler.py` | MongoDB connection, JSON-schema validators, compound/unique indexes, idempotent bulk upserts |
-| `data_fetcher.py` | yfinance OHLCV + macro, NSE FII/DII cash, NiftyTrader/Moneycontrol cash history, participant-wise OI parser, CSV back-fill, `DataService` facade |
-| `indicators.py` | Full quant engine; `python indicators.py NIFTYBEES.NS 1D` prints the analysis as JSON |
-| `app.py` | Desktop GUI: live tab, chart tab, scanner tab, decision panels |
-| `live_view.py` | Live one-screen dashboard (tiles, range bars, auto-refresh) |
+| `db_handler.py` | MongoDB connection, JSON-schema validators, indexes, idempotent bulk upserts |
+| `data_fetcher.py` | NSE / Yahoo / NiftyTrader / Moneycontrol fetchers, participant-OI parser, `DataService` facade |
+| `indicators.py` | Index-analysis engine; `python indicators.py NIFTYBEES.NS 1D` prints the analysis as JSON |
+| `live_view.py`, `rt_chart.py` + `chart_web/`, `chain_view.py`, `options_view.py`, `trades_view.py`, `ai_view.py` | The screens |
 
 ### MongoDB collections
 
 | Collection | Key / index | Main fields |
 |---|---|---|
-| `index_ohlcv` | unique `(symbol, timeframe, timestamp)` + `(symbol, timestamp desc)` | open, high, low, close, volume |
-| `fii_dii_activity` | unique `date` | fii_cash_net, dii_cash_net, fii_index_futures_long_short_ratio, client_ratio, pcr, fii_index_fut_net_oi, … |
+| `index_ohlcv` | unique `(symbol, timeframe, timestamp)` + `(symbol, timestamp desc)` | open, high, low, close, volume · timeframes 1D, 1H, 15m and 1m |
+| `fii_dii_activity` | unique `date` | fii/dii cash buy/sell/net, and for FII, DII, Pro and Client: index futures, index calls, index puts and stock futures long/short contracts, PCR, ratios |
 | `sr_levels` | unique `(symbol, timeframe, calculated_date)` | support_zones[], resistance_zones[], poc_level, vah, val, pivots, projection, signal |
 | `macro_series` | unique `(series, date)` | close |
 | `broker_fills`, `broker_orders`, `pnl_daily`, `trade_journal` | unique `fill_id` / `(order_no, date)` / `date` / `strategy_id` | Trades & P&L tab data |
 | `ai_reviews` | unique `review_id` | time, model, preset, question, answer, tokens |
+| `option_chain_snapshots` | unique `(underlying, expiry, ts)` | spot, source, NSE-shaped chain rows (OI, change, LTP, bid/ask, volume) every 5 min |
+| `broker_positions` | unique `date` | the day's Shoonya position book (offline copy) |
+| `sync_log` | unique `job` | last run, outcome and latest FII/DII dates per sync job |
 
 Every write is an `UpdateOne(..., upsert=True)` keyed on the natural key, so running a sync again never duplicates data. FII cash and participant-OI records for the same date are merged with `$set`.
 
@@ -331,16 +365,17 @@ Without a broker connection, live prices come from NSE's website snapshots, whic
 * Values in `.env` are never copied into `~/.nse_analytics/shoonya.json`.
 
 **To connect:**
-1. Click **Connect Shoonya (real-time)**. It's in the Live and Options tab headers and in the status bar.
+1. Click **Connect Shoonya** at the top right of the app bar. It's the one place the app connects, and every screen uses that connection.
 2. Enter your user ID, client ID and secret, then click **Sign in with Shoonya**.
 3. Shoonya's own login page opens in your browser. Sign in there with your password and TOTP; the app never sees them.
 4. Shoonya redirects back to `127.0.0.1:8765`, where the app catches the one-time code and exchanges it for the day's access token.
 5. If the browser shows an error page instead, paste its address into the waiting dialog.
 
-With "Remember" ticked, the user ID, client ID, secret and the day's token are saved to `~/.nse_analytics/shoonya.json`. That file is owner-only and lives outside the repo. Reconnecting the same day skips the browser step.
+With "Remember" ticked, the user ID, client ID, secret and the day's token are saved to `~/.nse_analytics/shoonya.json`. That file is owner-only and lives outside the repo. **At start-up the app reconnects silently with today's saved session**, with no browser or dialog. Reconnecting the same day also skips the browser step.
 
 What you get once connected:
-* **Live tab:** NIFTY 50, NIFTY Bank, India VIX and the tracking ETFs update every second. The other indices stay on NSE snapshots.
+* **Live overview:** NIFTY 50, BANKNIFTY, Next 50, Fin Service, Midcap Select, India VIX and every tracking ETF update every second. The other indices stay on NSE snapshots, because Shoonya doesn't stream them.
+* **Intraday chart and Index analysis:** candles come from Shoonya and are stored in MongoDB.
 * **Options tab:** the analysis runs on Shoonya's live option chain (±40 strikes around ATM) every 5 seconds, labelled **● Shoonya real-time**. PCR covers those strikes only.
 * **Fallback:** if Shoonya drops or a lookup fails, the app falls back to NSE automatically and says why.
 
@@ -350,6 +385,51 @@ What you get once connected:
 * **Websocket:** `wss://api.shoonya.com/NorenWSAPI/`.
 
 **No orders:** the client is read-only. It never calls an order route.
+
+### FII / DII flows screen (direction for option writing)
+**Automatic sync.** The scheduler checks NSE:
+* at start-up;
+* every 15 minutes from 4:30 pm to 11 pm IST on weekdays, until both of today's datasets are stored:
+  * the provisional FII/DII cash figures (usually 5–7 pm);
+  * participant-wise F&O open interest (usually 7–9 pm).
+
+Missing recent sessions are back-filled, as is cash history from NiftyTrader/Moneycontrol. **⟳ Check for new data** runs it on demand. Participant OI is stored for all four participant types (FII, DII, Pro, Client) and four instruments (index futures, index calls, index puts, stock futures), long and short.
+
+**Positioning score (−100 … +100).** Eight signals, each scored −2 … +2 against its own recent history so thresholds adapt, then weighted:
+
+| Signal | Reads | Weight |
+|---|---|---|
+| FII cash flow (5 sessions) | net buying lifts the market | 1.0 |
+| DII cash flow (5 sessions) | domestic buying cushions falls | 0.5 |
+| FII index futures | 5-session change in long share and net contracts | 1.5 |
+| FII index options | calls net − puts net, 5-session change | 1.0 |
+| Pro index options | prop desks' option tilt | 0.5 |
+| Client futures (contrarian) | crowded retail longs → weakness | 0.75 |
+| Put-call ratio | high PCR = put writers defending | 0.5 |
+| NIFTY trend (10 sessions) | the tape confirms or contradicts | 1.0 |
+
+**What the screen shows:**
+* **Posture.** The bias maps to a writing posture:
+  * **Bullish:** put writing; calls far or none.
+  * **Mildly bullish / bearish:** skewed condors.
+  * **Neutral:** a balanced condor at ±1σ.
+  * **Bearish:** call writing.
+  * Each comes with structures that fit and what to avoid.
+* **Strike zones** from the live chains: the farther of a bias-scaled expected move (0.8–1.4σ) and the OI wall on that side, with a wing about 0.5σ beyond.
+* **Warnings:**
+  * extreme FII shorts (short-covering risk for call writers);
+  * cash and futures disagreeing;
+  * price trend against the read;
+  * stale data.
+* **Track record.** A walk-forward check over the stored sessions, for example: "after bullish readings, NIFTY did not fall more than 1σ in the next 5 sessions in 87% of cases".
+* **Charts and table:**
+  * cash flows (FII, DII, FII 20-session total);
+  * FII index futures (long share and net contracts);
+  * FII index options (calls net, puts net);
+  * the score against NIFTY;
+  * the daily data table.
+
+The AI coach also receives this read. It is rule-based screening of published data, not a forecast or investment advice.
 
 ### Trades & P&L tab (positions, orders, journal, "why I lost")
 

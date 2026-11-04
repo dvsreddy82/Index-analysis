@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import html
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
-from PySide6.QtWidgets import (QTabWidget, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
-                               QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea,
-                               QSizePolicy, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QPushButton,
+                               QScrollArea, QSizePolicy, QTabWidget, QVBoxLayout, QWidget)
 
 from chain_view import ChainView, StrikeChart
-from live_view import C
+from theme import C
 from options import _edge
 
 CE_COLOR, PE_COLOR = "#ef4444", "#22c55e"   # call writers cap the upside, put writers the downside
@@ -136,7 +135,6 @@ class OIChart(QWidget):
 
 class OptionsDashboard(QWidget):
     refresh_requested = Signal(str, str)     # underlying, expiry ("" = auto)
-    broker_requested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -167,10 +165,6 @@ class OptionsDashboard(QWidget):
         hl.addWidget(self.expiry)
         self.info = _label("Select an index to load its option chain")
         hl.addWidget(self.info, 1)
-        self.broker = QPushButton("Connect Shoonya (real-time)")
-        self.broker.setToolTip("Log in to Shoonya for real-time option prices (read-only)")
-        self.broker.clicked.connect(self.broker_requested.emit)
-        hl.addWidget(self.broker)
         self.auto = QCheckBox("Auto-refresh")
         self.auto.setChecked(True)
         hl.addWidget(self.auto)
@@ -278,6 +272,9 @@ class OptionsDashboard(QWidget):
     @staticmethod
     def _source(r) -> str:
         ts = html.escape(str(r.get("timestamp")))
+        if r.get("source") == "offline":
+            return (f"<span style='color:{C['down']}'>● Offline — stored chain</span> <span style='color:{C['muted']}'>"
+                    f"{html.escape(r.get('source_note') or '')}</span>")
         if r.get("source") == "shoonya":
             return f"<span style='color:{C['up']}'>● Shoonya real-time</span> <span style='color:{C['muted']}'>{ts}</span>"
         note = f" · {html.escape(r['source_note'])}" if r.get("source_note") else ""
@@ -382,113 +379,3 @@ class OptionsDashboard(QWidget):
         l.addWidget(_label(f"<div style='color:{C['up']};font-weight:700'>Management plan (positional)</div>"
                            + _bul(s["exit"])))
         return f
-
-
-class ShoonyaDialog(QDialog):
-    """Client ID / secret for Shoonya's OAuth login. Password and TOTP are typed on
-    Shoonya's own page in the browser, never in this app."""
-
-    def __init__(self, settings: dict, redirect_url: str, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Connect Shoonya — real-time data (read-only)")
-        self.setMinimumWidth(500)
-        lay = QVBoxLayout(self)
-        lay.addWidget(_label(
-            f"<span style='color:{C['muted']}'>Used only for live prices and option chains — this app never "
-            "places orders. On <b>trade.shoonya.com → Profile → API Key</b>, copy your <b>Client ID</b> and "
-            "<b>Secret code</b>, and set the redirect URL to:</span>"))
-        url = QLineEdit(redirect_url)
-        url.setReadOnly(True)
-        lay.addWidget(url)
-        lay.addWidget(_label(f"<span style='color:{C['muted']}'>You then sign in with your password and TOTP on "
-                             "Shoonya's own page in your browser — this app never sees them.</span>"))
-        form = QFormLayout()
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-        self.f: dict[str, QLineEdit] = {}
-        for key, label, secret in (("user_id", "User ID", False), ("client_id", "Client ID (API key)", False),
-                                   ("secret", "Secret code", True)):
-            e = QLineEdit(settings.get(key, ""))
-            if secret:
-                e.setEchoMode(QLineEdit.EchoMode.Password)
-            self.f[key] = e
-            form.addRow(label, e)
-        lay.addLayout(form)
-        self.remember = QCheckBox("Remember these and today's session on this computer")
-        self.remember.setChecked(True)
-        lay.addWidget(self.remember)
-        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Sign in with Shoonya")
-        btns.accepted.connect(self._ok)
-        btns.rejected.connect(self.reject)
-        lay.addWidget(btns)
-
-    def _ok(self):
-        if all(self.f[k].text().strip() for k in self.f):
-            self.accept()
-
-    def values(self) -> dict:
-        return {k: e.text().strip() for k, e in self.f.items()}
-
-
-class ShoonyaWaitDialog(QDialog):
-    """Waits for the browser redirect; the user can also paste the redirected URL."""
-
-    def __init__(self, auth_url: str, poll, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Signing in to Shoonya…")
-        self.setMinimumWidth(520)
-        self.code: str | None = None
-        self._poll = poll
-        lay = QVBoxLayout(self)
-        lay.addWidget(_label("Finish signing in on Shoonya's page that just opened in your browser. "
-                             "This window closes by itself when Shoonya sends you back."))
-        link = _label(f"<a href='{html.escape(auth_url)}' style='color:{C['accent']}'>Open the sign-in page again</a>")
-        link.setOpenExternalLinks(True)
-        lay.addWidget(link)
-        from shoonya_feed import totp_now
-        self._totp = totp_now
-        if totp_now():
-            row = QHBoxLayout()
-            self.code_lbl = _label()
-            row.addWidget(self.code_lbl, 1)
-            copy = QPushButton("Copy code")
-            copy.clicked.connect(lambda: QApplication.clipboard().setText((totp_now() or ("",))[0]))
-            row.addWidget(copy)
-            lay.addLayout(row)
-            self._tick_code()
-            t = QTimer(self)
-            t.timeout.connect(self._tick_code)
-            t.start(1000)
-        lay.addWidget(_label(f"<span style='color:{C['muted']}'>If the browser shows an error page after "
-                             "signing in, copy its full address and paste it here:</span>"))
-        self.paste = QLineEdit()
-        self.paste.setPlaceholderText("http://127.0.0.1:8765/shoonya/callback?code=…")
-        lay.addWidget(self.paste)
-        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Use pasted address")
-        btns.accepted.connect(self._use_paste)
-        btns.rejected.connect(self.reject)
-        lay.addWidget(btns)
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self._check)
-        self.timer.start(300)
-
-    def _tick_code(self):
-        now = self._totp()
-        if now:
-            code, left = now
-            self.code_lbl.setText(f"TOTP for Shoonya's page: <b style='font-size:18px;letter-spacing:2px'>"
-                                  f"{code[:3]} {code[3:]}</b> <span style='color:{C['muted']}'>· {left}s left</span>")
-
-    def _check(self):
-        code = self._poll()
-        if code:
-            self.code = code
-            self.accept()
-
-    def _use_paste(self):
-        from shoonya_feed import code_from_text
-        code = code_from_text(self.paste.text())
-        if code:
-            self.code = code
-            self.accept()

@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel
                                QListWidgetItem, QPushButton, QSplitter, QTextBrowser, QVBoxLayout, QWidget)
 
 import ai_coach as ai
-from live_view import C
+from theme import C
 
 
 class _Bridge(QObject):
