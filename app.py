@@ -352,7 +352,7 @@ class MainWindow(QMainWindow):
         self.opts.refresh_requested.connect(self.load_options)
         self.opts.broker_requested.connect(self.connect_shoonya)
         self.live.broker_requested.connect(self.connect_shoonya)
-        self.tabs.addTab(self.opts, "Options — NIFTY / BANKNIFTY")
+        self.tabs.addTab(self.opts, "Option chain — NIFTY / BANKNIFTY")
         self.trades = TradesDashboard()
         self.trades.sync_requested.connect(lambda: self.sync_trades(pull=True))
         self.trades.recompute_requested.connect(lambda: self.sync_trades(pull=False))

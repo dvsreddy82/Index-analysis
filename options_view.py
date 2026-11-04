@@ -6,10 +6,11 @@ import html
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
+from PySide6.QtWidgets import (QTabWidget, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
                                QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea,
                                QSizePolicy, QVBoxLayout, QWidget)
 
+from chain_view import ChainView, StrikeChart
 from live_view import C
 from options import _edge
 
@@ -186,7 +187,22 @@ class OptionsDashboard(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidget(body)
-        lay.addWidget(scroll, 1)
+
+        # sub-tabs: the option chain itself, OI / IV charts, and the selling analysis
+        self.views = QTabWidget()
+        self.chain = ChainView()
+        self.chain.rng.idClicked.connect(lambda _: self._charts())
+        self.views.addTab(self.chain, "Option chain")
+        charts = QWidget(objectName="root")
+        cl = QVBoxLayout(charts)
+        cl.setContentsMargins(0, 6, 0, 0)
+        cl.setSpacing(6)
+        self.strike_charts = [StrikeChart("oi"), StrikeChart("chg"), StrikeChart("iv")]
+        for ch in self.strike_charts:
+            cl.addWidget(ch, 1)
+        self.views.addTab(charts, "OI · change in OI · IV smile")
+        self.views.addTab(scroll, "Selling analysis && strategies")
+        lay.addWidget(self.views, 1)
 
         top = QHBoxLayout()
         top.setSpacing(8)
@@ -250,6 +266,14 @@ class OptionsDashboard(QWidget):
         self._render_verdict(r)
         self.chart.set_result(r)
         self._render_strategies(r)
+        self.chain.set_result(r)
+        self._charts()
+
+    def _charts(self):
+        if self.res:
+            rows = self.chain.rows()
+            for ch in self.strike_charts:
+                ch.set_data(self.res, rows)
 
     @staticmethod
     def _source(r) -> str:

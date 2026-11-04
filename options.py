@@ -136,6 +136,7 @@ def parse_chain(js: dict, expiry: str) -> tuple[dict, pd.DataFrame]:
             row[f"{p}_ask"] = float(o.get("sellPrice1") or 0)
             row[f"{p}_vol"] = float(o.get("totalTradedVolume") or 0)
             row[f"{p}_nse_iv"] = float(o.get("impliedVolatility") or 0)
+            row[f"{p}_px_chg"] = float(o.get("change") or 0)          # option price change vs previous close
             spot = spot or float(o.get("underlyingValue") or 0)
         rows.append(row)
     df = pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
@@ -182,6 +183,65 @@ def enrich(df: pd.DataFrame, S: float, T: float) -> pd.DataFrame:
         df[f"{p}_iv"] = ivs
         df[f"{p}_delta"] = deltas
     return df
+
+
+# =========================================================== full chain view
+BUILDUP = {(1, 1): "Long build-up", (-1, 1): "Short build-up", (1, -1): "Short covering", (-1, -1): "Long unwinding"}
+CHAIN_SIDE = 40          # strikes each side of ATM kept for the chain view
+
+
+def _sgn(v: float) -> int:
+    return 1 if v > 0 else -1 if v < 0 else 0
+
+
+def buildup(px_chg: float, oi_chg: float) -> str:
+    """Classic price-vs-OI read: price up + OI up = long build-up, price down + OI up =
+    short build-up (writers adding), price up + OI down = short covering, price down + OI
+    down = long unwinding."""
+    return BUILDUP.get((_sgn(px_chg), _sgn(oi_chg)), "")
+
+
+def build_chain(df: pd.DataFrame, S: float, T: float, step: float, mp: float, lot: int) -> tuple[list[dict], dict]:
+    """Per-strike rows for the option-chain table (±CHAIN_SIDE strikes around ATM)
+    with IV, Greeks, price change, build-up and strike PCR, plus chain totals."""
+    i_atm = int((df["strike"] - S).abs().idxmin())
+    sub = df.iloc[max(i_atm - CHAIN_SIDE, 0): i_atm + CHAIN_SIDE + 1]
+    rows = []
+    for _, r in sub.iterrows():
+        k = float(r.strike)
+        row = {"strike": k, "pcr": (r.pe_oi / r.ce_oi) if r.ce_oi else None}
+        for p, kind in (("ce", "CE"), ("pe", "PE")):
+            iv = r[f"{p}_iv"]
+            g = bs_greeks(S, k, T, iv, kind) if iv else {}
+            ltp, chg = float(r[f"{p}_ltp"]), float(r[f"{p}_px_chg"])
+            prev = ltp - chg
+            row.update({
+                f"{p}_oi": float(r[f"{p}_oi"]), f"{p}_chg_oi": float(r[f"{p}_chg_oi"]),
+                f"{p}_oi_pct": (float(r[f"{p}_chg_oi"]) / (r[f"{p}_oi"] - r[f"{p}_chg_oi"]) * 100)
+                if r[f"{p}_oi"] - r[f"{p}_chg_oi"] > 0 else None,
+                f"{p}_ltp": ltp, f"{p}_chg": chg, f"{p}_chg_pct": chg / prev * 100 if prev > 0 else None,
+                f"{p}_bid": float(r[f"{p}_bid"]), f"{p}_ask": float(r[f"{p}_ask"]), f"{p}_vol": float(r[f"{p}_vol"]),
+                f"{p}_iv": iv * 100 if iv else None, f"{p}_delta": g.get("delta"), f"{p}_gamma": g.get("gamma"),
+                f"{p}_theta": g.get("theta"), f"{p}_vega": g.get("vega"),
+                f"{p}_intrinsic": max(0.0, S - k) if kind == "CE" else max(0.0, k - S),
+                f"{p}_buildup": buildup(chg, float(r[f"{p}_chg_oi"])) if ltp else "",
+            })
+            row[f"{p}_time_value"] = max(ltp - row[f"{p}_intrinsic"], 0.0) if ltp else None
+        rows.append(row)
+    ce_oi, pe_oi = float(df.ce_oi.sum()), float(df.pe_oi.sum())
+    ce_chg, pe_chg = float(df.ce_chg_oi.sum()), float(df.pe_chg_oi.sum())
+    above, below = df[df.strike >= S], df[df.strike <= S]
+    summary = {
+        "ce_oi": ce_oi, "pe_oi": pe_oi, "ce_chg_oi": ce_chg, "pe_chg_oi": pe_chg,
+        "pcr": pe_oi / ce_oi if ce_oi else None, "pcr_chg": pe_chg / ce_chg if ce_chg > 0 else None,
+        "ce_vol": float(df.ce_vol.sum()), "pe_vol": float(df.pe_vol.sum()),
+        "resistance": float(above.loc[above.ce_oi.idxmax(), "strike"]) if len(above) and above.ce_oi.max() > 0 else None,
+        "support": float(below.loc[below.pe_oi.idxmax(), "strike"]) if len(below) and below.pe_oi.max() > 0 else None,
+        "res_add": float(above.loc[above.ce_chg_oi.idxmax(), "strike"]) if len(above) and above.ce_chg_oi.max() > 0 else None,
+        "sup_add": float(below.loc[below.pe_chg_oi.idxmax(), "strike"]) if len(below) and below.pe_chg_oi.max() > 0 else None,
+        "max_pain": mp, "lot": lot, "step": step,
+    }
+    return rows, summary
 
 
 # =========================================================== market read
@@ -515,6 +575,7 @@ def analyze_chain(underlying: str, js: dict, expiry: str, daily: pd.DataFrame | 
             s["fit"] = _fit(s, bias, adx, score)
         strategies.sort(key=lambda s: -s["fit"])
 
+    chain, chain_sum = build_chain(df, S, T, step, mp, u["lot"])
     half = max(12 * step, 1.6 * (sigma_move or 0))     # wide enough to show the short strikes
     near = df[(df.strike >= S - half) & (df.strike <= S + half)]
     return {
@@ -529,6 +590,7 @@ def analyze_chain(underlying: str, js: dict, expiry: str, daily: pd.DataFrame | 
         "vix": vix_now, "vix_pct": vix_pct, "bias": bias, "adx": adx, "trend": regime.get("trend"),
         "checks": checks, "score": score, "verdict": verdict, "events": events,
         "strategies": strategies,
+        "chain": chain, "chain_summary": chain_sum,
         "oi_table": near[["strike", "ce_oi", "pe_oi", "ce_chg_oi", "pe_chg_oi", "ce_ltp", "pe_ltp",
                           "ce_iv", "pe_iv"]].to_dict("records"),
     }

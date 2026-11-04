@@ -504,6 +504,7 @@ class ShoonyaFeed:
                 "openInterest": oi / lot,
                 "changeinOpenInterest": (oi - poi) / lot if poi is not None else 0.0,
                 "lastPrice": _f(t.get("lp")) or 0.0,
+                "change": ((_f(t.get("lp")) or 0.0) - _f(t.get("c"))) if _f(t.get("c")) and _f(t.get("lp")) else 0.0,
                 "buyPrice1": _f(t.get("bp1")) or 0.0,
                 "sellPrice1": _f(t.get("sp1")) or 0.0,
                 "totalTradedVolume": (_f(t.get("v")) or 0.0) / lot,

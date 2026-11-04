@@ -381,6 +381,22 @@ The tab reads your Shoonya account through read-only calls (PositionBook, OrderB
   * **Setup:** `brew install ollama` (or the app from ollama.com), then `ollama pull qwen3:14b`. The app starts `ollama serve` itself if it isn't running.
   * **Model choice:** `qwen3:14b` (~9.3 GB) is the default. It reasons well over numbers and fits in 24 GB of memory alongside the app. `gpt-oss:20b` (~14 GB) is a slightly stronger, slower alternative; `qwen3:8b` (~5 GB) suits 16 GB machines. Finance-specific fine-tunes are generally weaker than these general reasoning models at this kind of analysis. Set `AI_MODEL` / `OLLAMA_HOST` in `.env` to change the default or the server. *Deep thinking* lets the model reason before answering: slower, but more careful.
 
+### Option chain tab (NIFTY / BANKNIFTY)
+Pick NIFTY or BANKNIFTY and an expiry. With Shoonya connected the chain is real-time and refreshes every 5 seconds; otherwise it uses NSE's snapshot. The tab has three sub-tabs.
+* **Option chain:** the standard mirrored layout: calls on the left, the strike with its PCR in the middle, puts on the right.
+  * **Columns:** OI with a bar, change in OI with a bar, LTP with % change, IV, delta, volume and build-up. Gamma/theta/vega and bid/ask can be switched on; wide layouts scroll sideways.
+  * **Highlighting:** in-the-money cells are tinted, the ATM row is blue, a SPOT divider row (with the ±1σ move to expiry) sits between the strikes either side of spot, and the top-3 OI strikes on each side are bold.
+  * **Range:** ±10, ±15, ±20 or ±30 strikes, or all. **Centre on ATM** scrolls back.
+  * **Hover** any cell for the full contract: bid/ask, OI change %, every Greek, intrinsic and time value, and build-up.
+  * **Build-up:** price↑ OI↑ = long build-up, price↓ OI↑ = short build-up (writers adding), price↑ OI↓ = short covering, price↓ OI↓ = long unwinding.
+  * **Summary strip:**
+    * spot, ATM, ATM IV, ATM straddle (points and ₹ per lot) and the ±1σ expected range;
+    * PCR on OI and on change in OI, max pain, and the OI support (largest put OI) and resistance (largest call OI);
+    * total call/put OI and change, VIX, days left and lot size.
+  * **One-line read:** the OI range, where fresh writing is happening today, the PCR mood, and the put–call skew.
+* **OI · change in OI · IV smile:** strike charts with spot, max pain and the ±1σ band.
+* **Selling analysis & strategies:** the existing option-selling screen, below.
+
 ### Options tab (NIFTY / BANKNIFTY option selling)
 
 Reads NSE's live option chain (`api/option-chain-v3`) and screens **positional** premium-selling structures: an iron condor, a short strangle, and a bull-put or bear-call spread when the directional read is one-sided. It is a screening tool, not advice. Every probability is a model estimate.
