@@ -52,6 +52,7 @@ from indicators import analyze, to_sr_document
 from live_view import CHART_DAYS, LiveDashboard
 from market_data import MarketData
 from options_service import OptionsService
+from options import analyze_chain
 from options_view import OptionsDashboard
 from rt_chart import SYMBOLS as RT_SYMBOLS, RealtimeCharts
 from risk_view import RiskDashboard
@@ -576,6 +577,7 @@ class MainWindow(QMainWindow):
             at = self.trades_svc.last_book.get("at")
             extra["book_at"] = f"{at:%H:%M}" if at else None
         res = self.risk_view.results.values()
+        extra["setup"] = getattr(self, "_setup_active", None)
         extra["red"] = sum(1 for r in res for a in r["alerts"] if a["level"] == "RED")
         extra["amber"] = sum(1 for r in res for a in r["alerts"] if a["level"] == "AMBER")
         self.ticker.update(quotes, extra)
@@ -975,17 +977,66 @@ class MainWindow(QMainWindow):
 
     # ================================================================== FII / DII
     def load_fii(self):
-        svc = self.svc
+        svc, market, options = self.svc, self.market, self.options
 
         def job(_p):
-            return fii_analysis.analyse(svc.load_fii_dii(), svc.load_ohlcv("^NSEI", "1D"))
+            res = fii_analysis.analyse(svc.load_fii_dii(), svc.load_ohlcv("^NSEI", "1D"),
+                                       svc.load_ohlcv("NIFTY BANK", "1D"))
+            s = res.get("setup") if res.get("available") else None
+            res["setup_chains"] = []
+            if s:
+                day = pd.Timestamp(s["date"]).date()
+                for und in ("BANKNIFTY", "NIFTY"):
+                    chain = None
+                    live = options.fresh(und, 8 * 3600)
+                    if live and day == datetime.now().date():
+                        chain = live
+                    else:                                    # the closing chain stored for that session
+                        stored = market.last_chain(und)
+                        if stored and stored[2][:6] == f"{day:%d-%b}":        # saved on the setup's own session
+                            try:
+                                js, exp, _at = stored
+                                chain = analyze_chain(und, js, exp)
+                            except Exception as exc:
+                                log.warning("setup: %s chain not usable: %s", und, exc)
+                    conf = fii_analysis.chain_confirmation(s["direction"] or s["lean"], chain)
+                    if conf:
+                        res["setup_chains"].append(conf)
+            return res
 
         self.runner.start(job, self._fii_done, lambda e: log.warning("FII analysis failed: %s", e.splitlines()[0]))
 
     def _fii_done(self, res: dict):
         self.fii_view.set_result(res)
-        if res.get("available"):
-            self._status(f"FII/DII read {res['bias']} ({res['score']:+.0f}) as of {res['as_of']:%d %b}")
+        if not res.get("available"):
+            return
+        self._status(f"FII/DII read {res['bias']} ({res['score']:+.0f}) as of {res['as_of']:%d %b}")
+        s = res.get("setup")
+        self.fii_view.set_setup(s, res.get("setup_chains"))
+        self._setup_active = None
+        if not s or not s["direction"]:
+            return
+        age = (datetime.now().date() - pd.Timestamp(s["date"]).date()).days
+        if age > 4:                                       # stale data: show it, but don't alert
+            return
+        self._setup_active = s["direction"]
+        key = f"{pd.Timestamp(s['date']):%Y-%m-%d}:{s['direction']}"
+        done = (self.sync_svc.last.get("setup_alert") or {}).get("key")
+        if key == done:
+            return
+        g = (s.get("record") or {}).get(s["direction"]) or {}
+        conf = sum(1 for c in res.get("setup_chains") or [] if c["confirmed"])
+        side = "calls" if s["direction"] == "up" else "puts"
+        msg = (f"{'▲ UP' if s['direction'] == 'up' else '▼ DOWN'} squeeze-loading setup for "
+               f"{pd.Timestamp(s['date']):%d %b} close"
+               + (f" · chain confirms on {conf}/2" if res.get("setup_chains") else "")
+               + (f" · BANKNIFTY up next session {g['up']:.0f}% of {g['n']} past cases" if g.get("n") else "")
+               + f" · short {side} are the exposed side")
+        self.sync_svc._record("setup_alert", True, msg, {"key": key})
+        self._status("⚑ " + msg)
+        QApplication.beep()
+        QApplication.alert(self)
+        notify("NSE Quant Terminal — evening setup", msg)
 
     def _fii_brief(self) -> dict:
         """Compact FII/DII read for the AI coach."""
@@ -1509,6 +1560,19 @@ class MainWindow(QMainWindow):
             it = QTableWidgetItem(v)
             it.setForeground(QColor(color if j == 0 else C["text"] if j < 4 else C["muted"]))
             self.table.setItem(i, j, it)
+
+
+def notify(title: str, text: str):
+    """macOS notification-centre banner (best effort, non-blocking)."""
+    if sys.platform != "darwin":
+        return
+    import subprocess
+    esc = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')
+    try:
+        subprocess.Popen(["osascript", "-e", f'display notification "{esc(text)}" with title "{esc(title)}"'],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
 
 
 def _num(v) -> float:

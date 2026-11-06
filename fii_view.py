@@ -203,6 +203,11 @@ class FIIDashboard(QWidget):
         scroll.setWidget(body)
         outer.addWidget(scroll, 1)
 
+        f, l = card("Evening setup check · institutional squeeze loading")
+        self.setup_lbl = label(f"<span style='color:{C['muted']}'>Waiting for FII/DII data…</span>")
+        l.addWidget(self.setup_lbl)
+        lay.addWidget(f)
+
         top = QHBoxLayout()
         top.setSpacing(8)
         f, l = card("Positioning read → option-writing posture")
@@ -278,6 +283,49 @@ class FIIDashboard(QWidget):
         self.fresh.setText(text)
         self.sync_btn.setEnabled(not busy)
         self.sync_btn.setText("Checking…" if busy else "⟳ Check for new data")
+
+    def set_setup(self, s: dict | None, confirmations: list[dict] | None = None):
+        """The once-per-evening setup: conditions, chain confirmation, track record, directive."""
+        if not s:
+            return
+        mut = C["muted"]
+        d = s["direction"]
+        conds = "".join(f"<div>{'✅' if ok else '▫️'} {html.escape(name)}: <b>{html.escape(val)}</b></div>"
+                        for name, val, ok in s["conditions"])
+        conf = "".join(f"<div>{'✅' if c['confirmed'] else '▫️'} {html.escape(c['text'])}</div>"
+                       for c in confirmations or [])
+        rec = s.get("record") or {}
+        key = d or s["lean"]
+        g, a = rec.get(key) or {}, rec.get("all") or {}
+        if g.get("n"):
+            track = (f"After this {'up' if key == 'up' else 'down'} setup (<b>{g['n']}</b> times: "
+                     f"{', '.join(g['dates'])}), BANKNIFTY closed <b>up next session {g['up']:.0f}%</b> of the time "
+                     f"(avg {g['avg']:+.2f}%, gap-up {g['gap_up']:.0f}%, {g['big']} moves of ±1.5% or more) vs "
+                     f"{a.get('up', 0):.0f}% up / avg {a.get('avg', 0):+.2f}% across all {a.get('n', 0)} sessions."
+                     + (" <span style='color:#fdba74'>Very small sample — a lean, not a forecast.</span>"
+                        if g["n"] < 15 else ""))
+        else:
+            track = f"<span style='color:{mut}'>This setup has not appeared in the stored history yet.</span>"
+        if d:
+            col, bg = ("#22c55e", "#052e16") if d == "up" else ("#ef4444", "#450a0a")
+            head = (f"<div style='background:{bg};border-left:4px solid {col};padding:6px 10px'>"
+                    f"<b style='color:{col};font-size:15px'>{'▲ UP' if d == 'up' else '▼ DOWN'} SETUP ACTIVE</b>"
+                    f" <span style='color:{mut}'>for {s['date']:%a %d %b} close</span></div>")
+            directive = ("Option writers: short <b>calls</b> are the exposed side — no naked calls overnight; hedge "
+                         "or move them beyond 1.5σ; put writing below OI support fits the lean." if d == "up" else
+                         "Option writers: short <b>puts</b> are the exposed side — no naked puts overnight; hedge "
+                         "or move them beyond 1.5σ; call writing above OI resistance fits the lean.")
+        else:
+            head = (f"<b style='color:{mut}'>No setup for {s['date']:%a %d %b}</b> "
+                    f"<span style='color:{mut}'>(nearest: {s['lean']} — conditions below)</span>")
+            directive = ""
+        self.setup_lbl.setText(
+            head + f"<table width='100%'><tr><td width='50%' valign='top'>{conds}</td><td valign='top'>"
+            f"{conf or f'<span style=\'color:{mut}\'>Closing option chain not loaded yet.</span>'}</td></tr></table>"
+            f"<div style='margin-top:4px'>{track}</div>"
+            + (f"<div style='margin-top:4px'><b>{directive}</b></div>" if directive else "")
+            + f"<div style='color:{mut};font-size:11px'>Checked each evening once NSE publishes FII/DII data "
+              "(≈5–9 pm IST); you get one alert per session when it fires.</div>")
 
     def set_zone_results(self, results: dict[str, dict]):
         self.zone_res.update({k: v for k, v in results.items() if v})

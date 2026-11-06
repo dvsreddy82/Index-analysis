@@ -173,6 +173,8 @@ class MenuBarTicker:
                 if i:
                     segs.append(("   ", None))
                 segs += self._segments(s)
+            if self.extra.get("setup"):
+                segs.append(("  ⚑▲" if self.extra["setup"] == "up" else "  ⚑▼", self.extra["setup"] == "up"))
             if self.extra.get("red"):
                 segs.append((f"  ⚠{self.extra['red']}", False))
         plain = "".join(t for t, _ in segs)
@@ -215,6 +217,9 @@ class MenuBarTicker:
         if e.get("book_pnl") is not None:
             out.append((f"My open P&L  ₹{e['book_pnl']:+,.0f}" + (f"   (as of {e['book_at']})" if e.get("book_at")
                                                                    else ""), e["book_pnl"] >= 0))
+        if e.get("setup"):
+            out.append((f"Evening setup: {'▲ UP' if e['setup'] == 'up' else '▼ DOWN'} squeeze loading — short "
+                        f"{'calls' if e['setup'] == 'up' else 'puts'} exposed", e["setup"] == "up"))
         if e.get("red") or e.get("amber"):
             out.append((f"Risk monitor: {e.get('red', 0)} RED · {e.get('amber', 0)} AMBER", False if e.get("red")
                         else None))

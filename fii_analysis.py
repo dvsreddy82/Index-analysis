@@ -146,6 +146,11 @@ def bias_of(score: float) -> tuple[str, str]:
     return "Neutral / range", "#e5e7eb"
 
 
+def _ord(n: float) -> str:
+    n = int(round(n))
+    return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+
+
 def _fmt_cr(v):
     return "—" if v is None or pd.isna(v) else f"{v:+,.0f} cr"
 
@@ -171,7 +176,7 @@ def _streak(x: pd.Series) -> tuple[int, int]:
     return sign, n
 
 
-def analyse(fii: pd.DataFrame, nifty: pd.DataFrame | None) -> dict:
+def analyse(fii: pd.DataFrame, nifty: pd.DataFrame | None, banknifty: pd.DataFrame | None = None) -> dict:
     if fii is None or fii.empty:
         return {"available": False}
     f = build_frame(fii, nifty)
@@ -212,7 +217,7 @@ def analyse(fii: pd.DataFrame, nifty: pd.DataFrame | None) -> dict:
          f"({_fmt_k(chg('fii_fut_net'))})",
          ("adding longs / covering shorts" if s["fii_fut"] > 0.25 else
           "adding shorts / cutting longs" if s["fii_fut"] < -0.25 else "little change")
-         + (f" · long share at {long_rank:.0f}th percentile of 90 sessions" if long_rank is not None else "")),
+         + (f" · long share at {_ord(long_rank)} percentile of 90 sessions" if long_rank is not None else "")),
         ("fii_opt", _fmt_k(last["fii_opt_tilt"]), f"calls net {_fmt_k(last['fii_call_net'])} · puts net "
          f"{_fmt_k(last['fii_put_net'])} · 5-session change {_fmt_k(chg('fii_opt_tilt'))}",
          "option book turning bullish (calls bought / puts written)" if s["fii_opt"] > 0.25 else
@@ -221,11 +226,11 @@ def analyse(fii: pd.DataFrame, nifty: pd.DataFrame | None) -> dict:
          "prop desks leaning long" if s["pro_opt"] > 0.25 else "prop desks leaning short" if s["pro_opt"] < -0.25
          else "neutral"),
         ("client", f"long {last['client_long_pct']:.1f}%" if not pd.isna(last["client_long_pct"]) else "—",
-         f"{cl_rank:.0f}th percentile of 90 sessions" if cl_rank is not None else "—",
+         f"{_ord(cl_rank)} percentile of 90 sessions" if cl_rank is not None else "—",
          "retail crowded long (contrarian negative)" if s["client"] < -0.5 else
          "retail cautious (contrarian positive)" if s["client"] > 0.5 else "not extreme"),
         ("pcr", f"{last['pcr']:.2f}" if not pd.isna(last["pcr"]) else "—",
-         f"{pcr_rank:.0f}th percentile · 5-session change {chg('pcr') or 0:+.2f}" if pcr_rank is not None else "—",
+         f"{_ord(pcr_rank)} percentile · 5-session change {chg('pcr') or 0:+.2f}" if pcr_rank is not None else "—",
          "put writers defending (supportive)" if s["pcr"] > 0.5 else
          "call-heavy (capping)" if s["pcr"] < -0.5 else "balanced"),
         ("trend", f"{last['nifty_ret10']:+.1f}%" if "nifty_ret10" in f and not pd.isna(last["nifty_ret10"]) else "—",
@@ -253,7 +258,7 @@ def analyse(fii: pd.DataFrame, nifty: pd.DataFrame | None) -> dict:
     return {
         "available": True, "as_of": f.index[-1], "sessions": n, "score": score, "bias": bias, "color": color,
         "conviction": conviction, "agreement": agree, "components": components, "warnings": warnings,
-        "playbook": playbook(bias), "evidence": evidence(f), "frame": f,
+        "playbook": playbook(bias), "evidence": evidence(f), "frame": f, "setup": setup_check(f, banknifty),
         "streaks": {"fii": fii_streak, "dii": dii_streak},
     }
 
@@ -335,3 +340,99 @@ def evidence(f: pd.DataFrame) -> dict:
                   "put_safe": float((allp["fwd_min"] > -allp["sd5"]).mean() * 100) if len(allp) else None,
                   "call_safe": float((allp["fwd_max"] < allp["sd5"]).mean() * 100) if len(allp) else None}
     return out
+
+
+# ---------------------------------------------------------------- evening setup alert
+SETUP_SCORE = 50          # |positioning score| at or beyond this
+SETUP_FUT_DAYS = 2        # consecutive sessions of FII index-futures net moving the same way
+SETUP_CASH_DAYS = 3       # consecutive sessions of FII cash buying / selling
+
+
+def _run(x: pd.Series) -> pd.Series:
+    """Length of the current run of True values at each row."""
+    x = x.fillna(False).astype(int)
+    return x.groupby((x != x.shift()).cumsum()).cumsum() * x
+
+
+def setup_flags(f: pd.DataFrame) -> pd.DataFrame:
+    """Per session: the institutional squeeze-loading setup, up and down.
+    Up   = score ≥ +50, FII futures net rising ≥2 sessions (covering shorts / adding longs),
+           FII cash buying ≥3 sessions.   Down = the mirror image."""
+    fut = f["fii_fut_net"].diff()
+    out = pd.DataFrame(index=f.index)
+    out["fut_up_run"], out["fut_dn_run"] = _run(fut > 0), _run(fut < 0)
+    out["cash_buy_run"], out["cash_sell_run"] = _run(f["fii_cash"] > 0), _run(f["fii_cash"] < 0)
+    out["up"] = (f["score"] >= SETUP_SCORE) & (out["fut_up_run"] >= SETUP_FUT_DAYS) & \
+        (out["cash_buy_run"] >= SETUP_CASH_DAYS)
+    out["down"] = (f["score"] <= -SETUP_SCORE) & (out["fut_dn_run"] >= SETUP_FUT_DAYS) & \
+        (out["cash_sell_run"] >= SETUP_CASH_DAYS)
+    return out
+
+
+def setup_check(f: pd.DataFrame, banknifty: pd.DataFrame | None = None) -> dict:
+    """Today's (latest session's) setup, the conditions behind it, and how BANKNIFTY moved the
+    next session every previous time it fired, compared with all sessions."""
+    fl = setup_flags(f)
+    last = fl.iloc[-1]
+    row = f.iloc[-1]
+    direction = "up" if last["up"] else "down" if last["down"] else None
+    lean = "up" if row["score"] >= 0 else "down"
+    d = direction or lean
+    conds = [
+        (f"Positioning score {'≥ +' if d == 'up' else '≤ −'}{SETUP_SCORE}", f"{row['score']:+.0f}",
+         row["score"] >= SETUP_SCORE if d == "up" else row["score"] <= -SETUP_SCORE),
+        (f"FII index futures net {'rising (covering)' if d == 'up' else 'falling (adding shorts)'} "
+         f"≥ {SETUP_FUT_DAYS} sessions", f"{int(last['fut_up_run'] if d == 'up' else last['fut_dn_run'])} sessions",
+         (last["fut_up_run"] if d == "up" else last["fut_dn_run"]) >= SETUP_FUT_DAYS),
+        (f"FII cash {'buying' if d == 'up' else 'selling'} ≥ {SETUP_CASH_DAYS} sessions",
+         f"{int(last['cash_buy_run'] if d == 'up' else last['cash_sell_run'])} sessions",
+         (last["cash_buy_run"] if d == "up" else last["cash_sell_run"]) >= SETUP_CASH_DAYS),
+    ]
+    out = {"date": f.index[-1], "direction": direction, "lean": lean, "conditions": conds, "record": None}
+    if banknifty is not None and len(banknifty):
+        b = banknifty.copy()
+        b.index = (b.index.tz_convert("Asia/Kolkata").tz_localize(None) if b.index.tz is not None
+                   else b.index).normalize()
+        b = b[~b.index.duplicated(keep="last")]
+        nxt = pd.DataFrame({"ret": b["close"].shift(-1) / b["close"] - 1,
+                            "gap": b["open"].shift(-1) / b["close"] - 1}).reindex(f.index) * 100
+        hist = fl.join(nxt).iloc[MIN_HIST:].dropna(subset=["ret"])
+
+        def stats(g):
+            if not len(g):
+                return {"n": 0}
+            return {"n": int(len(g)), "up": float((g["ret"] > 0).mean() * 100), "avg": float(g["ret"].mean()),
+                    "gap_up": float((g["gap"] > 0).mean() * 100), "big": int((g["ret"].abs() >= 1.5).sum()),
+                    "dates": [f"{x:%d %b}" for x in g.index[-6:]]}
+        out["record"] = {"all": stats(hist), "up": stats(hist[hist["up"]]), "down": stats(hist[hist["down"]])}
+    return out
+
+
+def chain_confirmation(direction: str, res: dict | None) -> dict | None:
+    """Does the closing option chain agree?  Up: OTM calls within 1σ above spot being bought
+    (long build-up) and more puts than calls written today (PCR of the OI change > 1).
+    Down: the mirror image."""
+    if not res or not res.get("chain"):
+        return None
+    S, sig = res["spot"], res.get("sigma_move") or res["spot"] * 0.02
+    summ = res.get("chain_summary") or {}
+    if direction == "up":
+        band = [r for r in res["chain"] if S < r["strike"] <= S + sig]
+        bought = [r["strike"] for r in band if r.get("ce_buildup") == "Long build-up"]
+        pcr = summ.get("pcr_chg")
+        writers = pcr is not None and pcr > 1
+        txt_w = (f"PCR of today's OI change {pcr:.2f} ({'> 1: put writers defending' if writers else '≤ 1: no put-writing support'})"
+                 if pcr else "PCR change n/a")
+        side = "calls above spot"
+    else:
+        band = [r for r in res["chain"] if S - sig <= r["strike"] < S]
+        bought = [r["strike"] for r in band if r.get("pe_buildup") == "Long build-up"]
+        pcr = summ.get("pcr_chg")
+        writers = pcr is not None and pcr < 1
+        txt_w = (f"PCR of today's OI change {pcr:.2f} ({'< 1: call writers capping' if writers else '≥ 1: no call-writing cap'})"
+                 if pcr else "PCR change n/a")
+        side = "puts below spot"
+    share = len(bought) / len(band) if band else 0
+    return {"underlying": res["underlying"], "bought_share": share, "bought": bought, "writers": writers,
+            "confirmed": share >= 0.5 and writers,
+            "text": f"{res['underlying']}: {len(bought)}/{len(band)} {side} in long build-up · {txt_w}"}

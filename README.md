@@ -479,6 +479,17 @@ For NIFTY and BANKNIFTY side by side, in a fixed three-part format:
 
 Missing recent sessions are back-filled, as is cash history from NiftyTrader/Moneycontrol. **⟳ Check for new data** runs it on demand. Participant OI is stored for all four participant types (FII, DII, Pro, Client) and four instruments (index futures, index calls, index puts, stock futures), long and short.
 
+**Evening setup alert (institutional squeeze loading).** Each time new FII/DII data arrives, the app checks for the pattern seen on the evening of 4 Nov 2026, before BANKNIFTY gained 3.3% on 5 Nov.
+* **UP fires when all three hold:**
+  * positioning score ≥ +50;
+  * FII index-futures net rising for ≥ 2 sessions (covering shorts);
+  * FII cash buying for ≥ 3 sessions.
+* **DOWN** is the mirror image.
+* **Chain confirmation:** the closing option chain is checked for agreement. For UP, at least half the calls within 1σ above spot must show long build-up, and the PCR of the day's OI change must be above 1.
+* **Track record:** the screen shows how BANKNIFTY moved the next session every previous time the setup fired, against all sessions. For example: up 83% of 6 cases, average +0.89%, against 46% for all sessions. With so few cases, treat it as a lean, not a forecast.
+* **When it fires:** you get one alert per session (sound, dock bounce, a macOS notification, the status bar), and the menu-bar ticker shows ⚑▲ or ⚑▼ while it's active.
+* **The directive:** short calls are the exposed side after an UP setup, short puts after a DOWN setup.
+
 **Positioning score (−100 … +100).** Eight signals, each scored −2 … +2 against its own recent history so thresholds adapt, then weighted:
 
 | Signal | Reads | Weight |
