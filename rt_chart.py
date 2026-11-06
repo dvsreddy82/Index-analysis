@@ -22,6 +22,7 @@ import base64
 import calendar
 import json
 import logging
+import sys
 import time as _time
 from datetime import datetime, time as dtime
 from pathlib import Path
@@ -43,7 +44,8 @@ Bar = tuple  # (datetime IST-naive, open, high, low, close)
 SESSION_OPEN, SESSION_CLOSE = dtime(9, 15), dtime(15, 30)
 SYMBOLS = (("^NSEI", "NIFTY 50"), ("NIFTY BANK", "BANKNIFTY"))
 UND_SYMBOL = {"NIFTY": "^NSEI", "BANKNIFTY": "NIFTY BANK"}
-PAGE = Path(__file__).resolve().parent / "chart_web" / "chart.html"
+# inside the packaged app the bundled files live under sys._MEIPASS
+PAGE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "chart_web" / "chart.html"
 STATE_FILE = config.APP_HOME / "chart_state.json"
 
 

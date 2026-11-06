@@ -136,6 +136,7 @@ Everything is stored in MongoDB as it arrives, so the screens keep working witho
 | `fii_analysis.py` / `fii_view.py` | FII/DII positioning engine / screen |
 | `risk_engine.py` / `risk_view.py` | Writer risk monitor: threat detectors, GEX, safe zones, leg guidance / screen |
 | `menubar.py` | Live index ticker in the macOS menu bar (PyObjC NSStatusItem; Qt tray fallback) |
+| `packaging/` | macOS app build: PyInstaller spec, `build_mac.sh` (.app + .dmg), icon |
 | `config.py` | All tunables (Mongo URI, symbols, thresholds); each can be overridden by an environment variable |
 | `db_handler.py` | MongoDB connection, JSON-schema validators, indexes, idempotent bulk upserts |
 | `data_fetcher.py` | NSE / Yahoo / NiftyTrader / Moneycontrol fetchers, participant-OI parser, `DataService` facade |
@@ -191,6 +192,30 @@ source .venv/bin/activate
 ```bash
 pip install -r requirements.txt
 ```
+
+### macOS app (.app / .dmg)
+Build a double-clickable **NSE Quant Terminal.app** and a drag-to-Applications disk image:
+
+```bash
+.venv/bin/pip install pyinstaller
+packaging/build_mac.sh
+```
+
+**What you get:** `dist/NSE Quant Terminal.app` (≈500 MB, Apple Silicon) and `dist/NSE-Quant-Terminal-1.0.0.dmg` (≈210 MB).
+* Open the .dmg and drag the app to Applications. It has its own icon, and the menu-bar ticker works the same.
+* The size is mostly Qt WebEngine (Chromium), which the charts need. The build keeps only the Qt frameworks the app actually links to: 23 of 133.
+
+**Secrets are never bundled:**
+* The build fails if a `.env` or `shoonya.json` file ends up inside the app.
+* The installed app reads your settings at run time from `~/.nse_analytics/`: `.env` (copy your project `.env` there, `chmod 600`), today's Shoonya session, chart state and logs (`app.log`).
+
+**Still installed separately:** MongoDB (needed for storage; without it the app runs in memory only) and Ollama (optional, for the AI coach).
+
+**Signing:** the build is ad-hoc signed, not notarised. On another Mac, the first launch needs right-click → **Open**.
+
+**Other files:**
+* `packaging/NSEQuantTerminal.spec`: the PyInstaller recipe. Change `VERSION` there for a new release.
+* `packaging/make_icon.py`: redraws `AppIcon.icns`.
 
 ### First run
 ```bash

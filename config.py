@@ -28,7 +28,10 @@ def _load_dotenv(path: Path) -> None:
         os.environ.setdefault(key, val)
 
 
+# The project's .env (when run from source), then ~/.nse_analytics/.env — the one the packaged
+# macOS app reads, since secrets are never bundled into it.  The first value seen wins.
 _load_dotenv(Path(__file__).resolve().parent / ".env")
+_load_dotenv(Path(os.getenv("NSE_APP_HOME", str(Path.home() / ".nse_analytics"))) / ".env")
 
 
 def _env(name: str, default):

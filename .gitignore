@@ -31,3 +31,8 @@ data/db/
 .vscode/
 .idea/
 .DS_Store
+
+# Packaging output
+build/
+dist/
+packaging/AppIcon.iconset/
