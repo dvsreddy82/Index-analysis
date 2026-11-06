@@ -54,6 +54,9 @@ from market_data import MarketData
 from options_service import OptionsService
 from options_view import OptionsDashboard
 from rt_chart import SYMBOLS as RT_SYMBOLS, RealtimeCharts
+from risk_view import RiskDashboard
+import risk_engine
+import trades_engine as te
 from shoonya_feed import INDEX_TOKENS
 from sync_service import SyncService, market_open, now_ist
 from tasks import Runner, Task
@@ -249,7 +252,8 @@ class MainWindow(QMainWindow):
     (broker, market data, options, trades, sync); this class wires them to screens."""
 
     NAV = [("MARKETS", [("live", "◉  Live overview"), ("intraday", "◔  Intraday chart"),
-                        ("chain", "▦  Option chain"), ("fii", "⇅  FII / DII flows")]),
+                        ("chain", "▦  Option chain"), ("risk", "⚠  Writer risk monitor"),
+                        ("fii", "⇅  FII / DII flows")]),
            ("RESEARCH", [("analysis", "◇  Index analysis"), ("scanner", "☰  Scanner")]),
            ("MY TRADING", [("trades", "₹  Trades & P&L"), ("ai", "✦  AI coach")])]
 
@@ -323,6 +327,12 @@ class MainWindow(QMainWindow):
         self.opt_timer.setInterval(config.OPTIONS_REFRESH_SECONDS * 1000)
         self.opt_timer.timeout.connect(lambda: self.current_page() == "chain" and self.opts.request())
         self.opt_timer.start()
+        self._risk_at = 0.0
+        self._red_seen: set[str] = set()
+        self.risk_timer = QTimer(self)
+        self.risk_timer.setInterval(15_000)
+        self.risk_timer.timeout.connect(self.load_risk)
+        self.risk_timer.start()
 
         self._broker_state()
         self._sync_state()
@@ -418,6 +428,11 @@ class MainWindow(QMainWindow):
         self.opts.refresh_requested.connect(self.load_options)
         self._add("chain", "Option chain", "NIFTY / BANKNIFTY chain, OI and IV charts, and the option-selling "
                   "analysis · snapshots every 5 min are kept in MongoDB", self.opts)
+        self.risk_view = RiskDashboard()
+        self.risk_view.refresh_requested.connect(lambda: self.load_risk(force=True))
+        self._add("risk", "Writer risk monitor", "Squeeze, put-flush, institutional-divergence and negative-gamma "
+                  "checks for NIFTY / BANKNIFTY writers, with prohibitions, safe zones and guidance for your legs",
+                  self.risk_view)
         self.fii_view = FIIDashboard()
         self.fii_view.sync_requested.connect(lambda: self.sync_svc.run_fii("manual"))
         self.fii_view.import_requested.connect(self._import_fii_path)
@@ -456,7 +471,8 @@ class MainWindow(QMainWindow):
         self.trades.journal_saved.connect(self.save_journal)
         self._add("trades", "Trades & P&L", "Positions with management alerts, orders, fills, history, performance, "
                   "why you lost, and your journal · synced from Shoonya into MongoDB", self.trades)
-        self.ai = AICoachPanel(lambda: {**self.trades.data, "fii_read": self._fii_brief()} if self.trades.data else {},
+        self.ai = AICoachPanel(lambda: {**self.trades.data, "fii_read": self._fii_brief(),
+                                        "risk_monitor": self._risk_brief()} if self.trades.data else {},
                                self.svc.store, lambda: self.trades.period.currentText())
         self.ai.data_needed.connect(lambda: self.sync_trades(pull=self.broker.live))
         self._add("ai", "AI coach", "Chat with a local model (Ollama) about your own trades — nothing leaves this Mac",
@@ -495,6 +511,8 @@ class MainWindow(QMainWindow):
             self.opts.request()
         elif key in ("trades", "ai") and not self.trades.data:
             self.sync_trades(pull=self.broker.live)
+        elif key == "risk":
+            self.load_risk(force=time.time() - self._risk_at > 30)
         elif key == "fii" and len(self.fii_view.zone_res) < 2:
             self._chains_due(force=True)
 
@@ -773,6 +791,100 @@ class MainWindow(QMainWindow):
                 log.warning("Background chain failed: %s", e.splitlines()[0])
 
             self.runner.start(lambda _p, u=und: self.options.analyse(u, None), done, failed)
+
+    # ================================================================== writer risk monitor
+    def load_risk(self, force: bool = False):
+        """Every 30 s on the screen; every 3 min in the background while Shoonya is live in
+        market hours (so a new RED alert can be raised from any page)."""
+        if self._flags.get("risk"):
+            return
+        visible = self.current_page() == "risk"
+        if not force:
+            if not self.risk_view.auto.isChecked():
+                return
+            every = 30 if visible else (180 if self.broker.live and market_open() else None)
+            if every is None or time.time() - self._risk_at < every:
+                return
+        self._flags["risk"] = True
+        self._risk_at = time.time()
+        opts, svc, trades = self.options, self.svc, self.trades_svc
+
+        def job(_p):
+            fii = svc.load_fii_dii()
+            frame = fii_analysis.build_frame(fii, svc.load_ohlcv("^NSEI", "1D")) if len(fii) else None
+            book = trades.last_book.get("positions")
+            if book is None:
+                docs = svc.store.find_docs("broker_positions", sort="date", desc=True, limit=1)
+                book = docs[0].get("rows") if docs else []
+            out = {}
+            for und, sym in (("NIFTY", "^NSEI"), ("BANKNIFTY", "NIFTY BANK")):
+                try:
+                    res = opts.fresh(und, 45) or opts.analyse(und)
+                    hist = opts.intraday_history(und)
+                    prev = risk_engine.pick_previous(hist, res["expiry"])
+                    c = svc.store.load_ohlcv(sym, "1m", start=pd.Timestamp.now(tz=config.IST) - pd.Timedelta(minutes=90))
+                    path = list(zip(c.index, c["close"])) if c is not None and len(c) else []
+                    if path and market_open():
+                        path.append((pd.Timestamp.now(tz=config.IST), res["spot"]))
+                    groups = te.manage_positions(book or [], {und: res["spot"]}, {und: res.get("sigma_move")})
+                    legs = [l for g in groups if g["und"] == und for l in g["legs"]]
+                    chains = {}
+                    for e in {pd.Timestamp(l["expiry"]).strftime("%d-%b-%Y") for l in legs
+                              if l.get("expiry") is not None and l.get("qty")} - {res["expiry"]}:
+                        try:
+                            chains[e] = opts.analyse(und, e, record=False)
+                        except Exception as exc:
+                            log.warning("risk: %s %s chain failed: %s", und, e, exc)
+                    out[und] = risk_engine.assess(res, prev, path, frame, fii, legs, chains)
+                except Exception as exc:
+                    out[und] = {"error": str(exc)}
+            return out
+
+        def done(out):
+            self._flags["risk"] = False
+            reds = []
+            for und, r in out.items():
+                if "error" in r:
+                    self.risk_view.set_error(und, r["error"])
+                    continue
+                self.risk_view.set_result(und, r)
+                self._chain_result_light(und)
+                reds += [f"{und}: {a['title']}" for a in r["alerts"] if a["level"] == "RED"]
+            new = set(reds) - self._red_seen
+            self._red_seen = set(reds)
+            item = self.nav.item(self._nav_keys.index("risk"))
+            item.setText("⚠  Writer risk monitor" + (f"  ({len(reds)} RED)" if reds else ""))
+            item.setForeground(QColor(C["down"] if reds else C["muted"]))
+            self.risk_view.set_status(
+                f"Updated {datetime.now():%H:%M:%S}" + (f" · <b style='color:{C['down']}'>{len(reds)} RED alert(s)"
+                                                       f"</b>" if reds else " · no RED alerts"))
+            if new and self.risk_view.notify.isChecked():
+                self._status("🚨 " + " · ".join(sorted(new)))
+                QApplication.beep()
+                QApplication.alert(self)
+
+        def failed(err):
+            self._flags["risk"] = False
+            self.risk_view.set_status(f"<span style='color:{C['down']}'>Risk check failed: "
+                                      f"{html.escape(err.splitlines()[0])}</span>")
+
+        self.runner.start(job, done, failed)
+
+    def _chain_result_light(self, und: str):
+        res = self.options.fresh(und, 120)
+        if res:
+            self._chain_result(res)
+
+    def _risk_brief(self) -> dict:
+        """Latest risk-monitor output for the AI coach's Risk desk mode."""
+        out = {}
+        for und, r in self.risk_view.results.items():
+            out[und] = {k: r[k] for k in ("spot", "expiry", "dte", "regime", "bias", "danger_up", "danger_down",
+                                          "alerts", "prohibitions", "safe", "positions", "call_wall", "put_wall",
+                                          "atm_iv", "vix", "sigma", "window_min")}
+            out[und]["gex_net_cr_per_1pct"] = round(r["gex"]["net"] / 1e7, 2)
+            out[und]["gamma_flip"] = r["gex"].get("flip")
+        return out
 
     # ================================================================== FII / DII
     def load_fii(self):

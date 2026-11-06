@@ -60,13 +60,14 @@ plus the ETFs that track them.
 ## 1. Architecture
 
 ### Screens
-A left navigation rail groups the eight screens. **Ctrl+1 … Ctrl+8** jumps straight to each one.
+A left navigation rail groups the nine screens. **Ctrl+1 … Ctrl+9** jumps straight to each one.
 
 | Group | Screen | What it is for |
 |---|---|---|
 | Markets | **Live overview** | Every index and ETF on one screen: live price, change, key levels, EOD signal |
 | Markets | **Intraday chart** | NIFTY 50 / BANKNIFTY TradingView-style candles, indicators, levels, drawings, alerts |
 | Markets | **Option chain** | NIFTY / BANKNIFTY chain, OI and IV charts, option-selling analysis |
+| Markets | **Writer risk monitor** | Squeeze / put-flush / divergence / negative-gamma alerts with prohibitions, safe zones and guidance for your legs |
 | Markets | **FII / DII flows** | Institutional positioning → option-writing direction and strike zones |
 | Research | **Index analysis** | Zones, pivots, volume profile and decision card for any index or ETF |
 | Research | **Scanner** | Daily analysis of all 56 instruments in one table |
@@ -127,6 +128,7 @@ Everything is stored in MongoDB as it arrives, so the screens keep working witho
 | `trades_service.py` / `trades_engine.py` | Broker-book sync / journal analytics |
 | `sync_service.py` | Background scheduler and `sync_log` |
 | `fii_analysis.py` / `fii_view.py` | FII/DII positioning engine / screen |
+| `risk_engine.py` / `risk_view.py` | Writer risk monitor: threat detectors, GEX, safe zones, leg guidance / screen |
 | `config.py` | All tunables (Mongo URI, symbols, thresholds); each can be overridden by an environment variable |
 | `db_handler.py` | MongoDB connection, JSON-schema validators, indexes, idempotent bulk upserts |
 | `data_fetcher.py` | NSE / Yahoo / NiftyTrader / Moneycontrol fetchers, participant-OI parser, `DataService` facade |
@@ -385,6 +387,37 @@ What you get once connected:
 * **Websocket:** `wss://api.shoonya.com/NorenWSAPI/`.
 
 **No orders:** the client is read-only. It never calls an order route.
+
+### Writer risk monitor (protection for option writers)
+For NIFTY and BANKNIFTY side by side, in a fixed three-part format:
+1. **Threat matrix & regime:**
+   * the market regime: Positive Gamma Range-Bound, Negative Gamma Trending, or Squeeze in Progress;
+   * the current bias (from put vs call writing near spot and spot momentum);
+   * the maximum-danger strike on each side, with the reason.
+2. **Active alerts:** colour-coded. Each one quotes the exact numbers that fired it, for example "58,000 CE OI −1.2L today, −35K in 28 min".
+3. **Execution directives:**
+   * strict prohibitions;
+   * safe zones: the first strike beyond **both** 0.10 delta and 1.5× the expected move, with a hedge wing where needed;
+   * guidance for every open leg. It starts with the book's net delta per expiry (long wings included, e.g. "≈ −₹19,500 per +100 pts"), then each short leg: hold, trail (with the spot level where its delta reaches 0.30), hedge, or exit. Each leg is valued on its own expiry's chain.
+
+**Threat vectors** (all thresholds in `risk_engine.py`):
+
+| Vector | Fires when | Level |
+|---|---|---|
+| Gamma squeeze / call unwinding | spot within 0.5% of the call wall, **plus** at least two of: wall call OI falling (≥2% today or ≥3% intraday), ATM/OTM call IV up ≥0.4 vol pts while spot rises, the day's biggest put OI build sitting in the ATM band | RED (one extra condition: AMBER) |
+| Put flush / momentum down | the mirror image at the put wall | RED / AMBER |
+| Institutional divergence | FII index-futures long share > 65%, or a 2-session rebound of ≥3 pp from < 20%, or FII/Pro adding futures or call longs while clients net-write calls (EOD participant OI) | AMBER |
+| Low-vol compression / negative GEX | VIX < 12, the ATM straddle up ≥4% intraday despite decay, or net dealer gamma negative / spot trending ≥0.5% with ≤25% pullback | AMBER |
+
+**How the intraday comparison works:** changes compare with the chain about 30 minutes earlier (10–75 min window). History comes from memory and from today's stored snapshots, so it survives a restart.
+
+**Refresh and alerts:**
+* It refreshes every 30 s on screen, and every 3 min in the background while Shoonya is live in market hours.
+* A new RED alert beeps, bounces the dock icon, shows in the status bar and turns the nav item red.
+
+**AI coach link:** its **Risk desk (writer protection)** quick review writes the same analysis as a desk note. It is restricted to the monitor's numbers.
+
+**Caveats:** GEX uses the common dealer convention (long calls, short puts), which Indian option flow doesn't always follow. These are mechanical screens on exchange data, not forecasts or investment advice.
 
 ### FII / DII flows screen (direction for option writing)
 **Automatic sync.** The scheduler checks NSE:

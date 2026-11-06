@@ -11,9 +11,11 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 
 import pandas as pd
 
+import risk_engine
 from data_fetcher import pick_expiry
 from indicators import analyze
 from options import UNDERLYINGS, analyze_chain
@@ -32,6 +34,8 @@ class OptionsService:
         self._engine: dict[str, tuple[float, dict, pd.DataFrame]] = {}
         self._expiries: dict[str, tuple[float, list[str]]] = {}
         self._lock = threading.Lock()
+        self.history: dict[str, deque] = {}                       # underlying -> intraday chain observations
+        self._seeded: set[str] = set()
 
     def fresh(self, underlying: str, max_age: float = 900) -> dict | None:
         hit = self.latest.get(underlying)
@@ -61,7 +65,9 @@ class OptionsService:
             raise RuntimeError("no live option ticks")
         return js, exp
 
-    def analyse(self, underlying: str, expiry: str | None = None) -> dict:
+    def analyse(self, underlying: str, expiry: str | None = None, record: bool = True) -> dict:
+        """`record=False` (e.g. a second expiry for position checks) leaves `latest` and the
+        intraday history untouched."""
         js = note = None
         source, exp = "nse", expiry
         if self.broker.feed.live:
@@ -85,9 +91,38 @@ class OptionsService:
         engine, daily = self._engine_read(underlying)
         res = analyze_chain(underlying, js, exp, daily, self._vix(), engine)
         res["source"], res["source_note"] = source, note
+        if not record:
+            return res
         with self._lock:
             self.latest[underlying] = (time.time(), res)
+            if source != "offline":
+                self.history.setdefault(underlying, deque(maxlen=400)).append(risk_engine.compact(res))
         return res
+
+    def intraday_history(self, underlying: str) -> list[dict]:
+        """Today's observations of the chain: in-memory ones plus, the first time,
+        snapshots stored in MongoDB earlier today (so a restart keeps the comparison)."""
+        if underlying not in self._seeded:
+            self._seeded.add(underlying)
+            day = pd.Timestamp.now(tz="Asia/Kolkata").normalize()
+            seeded = []
+            for d in self.svc.store.find_docs("option_chain_snapshots", {"underlying": underlying}, sort="ts"):
+                ts = pd.Timestamp(d["ts"])
+                ts = ts if ts.tzinfo else ts.tz_localize("UTC")
+                if ts.tz_convert("Asia/Kolkata") < day:
+                    continue
+                js = {"records": {"underlyingValue": d.get("spot"), "data": d.get("data") or [],
+                                  "expiryDates": d.get("expiries") or [d["expiry"]]}}
+                obs = risk_engine.compact_from_js(js, d["expiry"], ts.timestamp())
+                if obs:
+                    seeded.append(obs)
+            with self._lock:
+                dq = self.history.setdefault(underlying, deque(maxlen=400))
+                merged = sorted(seeded + list(dq), key=lambda h: h["ts"])
+                dq.clear()
+                dq.extend(merged)
+        with self._lock:
+            return list(self.history.get(underlying) or [])
 
     def _engine_read(self, underlying: str):
         hit = self._engine.get(underlying)

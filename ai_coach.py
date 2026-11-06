@@ -57,7 +57,26 @@ Rules:
 - End with one italic line: "Automated review of your own data — not investment advice."
 """
 
+RISK_DESK = (
+    "Act as an institutional derivatives & quantitative risk analyst protecting this NIFTY / BANKNIFTY option "
+    "writer from tail moves, short squeezes and negative-gamma traps. Use ONLY `risk_monitor` (live chain "
+    "checks: walls, OI shifts, IV and straddle changes, GEX, participant OI) plus `open_positions` and "
+    "`institutional_positioning`. Quote the exact numbers behind each signal. Be quantitative, concise and "
+    "decisive; describe order-book mechanics (OI shifts, delta pressure, absorption), not hunches. Answer for "
+    "each index in exactly this structure:\n"
+    "#### 1. Threat Matrix & Regime Classification\n"
+    "* Market Regime: [Positive Gamma Range-Bound | Negative Gamma Trending | Squeeze in Progress]\n"
+    "* Current Bias: [Bullish Delta | Bearish Delta | Neutral Mean-Reverting]\n"
+    "* Max Danger Strike (Upside): [strike + reason]\n* Max Danger Strike (Downside): [strike + reason]\n"
+    "#### 2. Active Alerts (colour-coded)\n"
+    "* [RED ALERT] / [AMBER ALERT] / [GREEN FLAG - SAFE REGIME] with the exact signal that fired\n"
+    "#### 3. Execution Directives for Option Writer\n"
+    "* Strict Prohibitions\n* Safe / Permissible Zones (beyond 0.10 delta or outside 1.5x expected move)\n"
+    "* Existing Position Guidance (hold, trail delta stop, hedge with long wings, or exit) for every open leg\n"
+    "Use the regime, alerts and zones exactly as the monitor computed them; do not invent strikes or numbers.")
+
 PRESETS: dict[str, str] = {
+    "Risk desk (writer protection)": RISK_DESK,
     "Full review": (
         "Give me a complete review of my trading:\n"
         "1. Scorecard: net P&L, win rate, payoff, profit factor, expectancy, drawdown — one line of verdict.\n"
@@ -207,6 +226,7 @@ def build_brief(d: dict, period: str = "") -> dict:
     return {
         "data_notes": notes,
         "institutional_positioning": inst or "not available",
+        "risk_monitor": d.get("risk_monitor") or "not available (open the Writer risk monitor once)",
         "as_of": datetime.now().strftime("%Y-%m-%d %H:%M"), "period": period,
         "trader": {"style": "positional NIFTY/BANKNIFTY option seller, no scalping",
                    "lot_sizes": {"NIFTY": config.NIFTY_LOT, "BANKNIFTY": config.BANKNIFTY_LOT},
