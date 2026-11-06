@@ -57,7 +57,8 @@ from rt_chart import SYMBOLS as RT_SYMBOLS, RealtimeCharts
 from risk_view import RiskDashboard
 import risk_engine
 import trades_engine as te
-from shoonya_feed import INDEX_TOKENS
+from menubar import MenuBarTicker
+from shoonya_feed import INDEX_TOKENS, VIX_TOKEN
 from sync_service import SyncService, market_open, now_ist
 from tasks import Runner, Task
 from theme import C, QSS, page
@@ -334,6 +335,7 @@ class MainWindow(QMainWindow):
         self.risk_timer.timeout.connect(self.load_risk)
         self.risk_timer.start()
 
+        self.ticker = MenuBarTicker(on_open=self._bring_to_front)   # live index price in the menu bar
         self._broker_state()
         self._sync_state()
         self.nav.setCurrentRow(1)                  # Live overview
@@ -529,6 +531,42 @@ class MainWindow(QMainWindow):
             if self._last_snap and self.current_page() == "live":
                 self._show_snapshot()
             self._rtc_tick()
+        self._update_ticker()
+
+    def _update_ticker(self):
+        """Menu-bar ticker: Shoonya ticks when live, else the latest NSE snapshot."""
+        feed, quotes = self.broker.feed, {}
+        snap = (self._last_snap or {}).get("quotes") or {}
+        for sym, key in (("NIFTY BANK", INDEX_TOKENS["NIFTY BANK"]), ("^NSEI", INDEX_TOKENS["^NSEI"]),
+                         ("INDIA VIX", VIX_TOKEN)):
+            t = feed.tick(key) if feed.live else None
+            if t and feed._fresh(t):
+                quotes[sym] = {"last": _num(t.get("lp")), "prev": _num(t.get("c")) or None,
+                               "high": _num(t.get("h")) or None, "low": _num(t.get("l")) or None}
+            elif sym == "INDIA VIX":
+                v = (self._last_snap or {}).get("vix") or {}
+                if v.get("last"):
+                    quotes[sym] = {"last": v["last"], "prev": v.get("prev") or
+                                   (v["last"] - v["change"] if v.get("change") is not None else None)}
+            elif snap.get(sym, {}).get("last"):
+                q = snap[sym]
+                quotes[sym] = {"last": q["last"], "prev": q.get("prev"), "high": q.get("high"), "low": q.get("low")}
+        extra = {"source": "Shoonya real-time" if feed.live else
+                 ("NSE snapshot (≈15 s)" if snap else "waiting for prices — open the app or connect Shoonya")}
+        td = self.trades.data or {}
+        if td.get("positions"):
+            extra["book_pnl"] = (td.get("today") or {}).get("open")
+            at = self.trades_svc.last_book.get("at")
+            extra["book_at"] = f"{at:%H:%M}" if at else None
+        res = self.risk_view.results.values()
+        extra["red"] = sum(1 for r in res for a in r["alerts"] if a["level"] == "RED")
+        extra["amber"] = sum(1 for r in res for a in r["alerts"] if a["level"] == "AMBER")
+        self.ticker.update(quotes, extra)
+
+    def _bring_to_front(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
 
     def _broker_state(self):
         kind, text, color = self.broker.state()
@@ -587,6 +625,7 @@ class MainWindow(QMainWindow):
         self._status("Shoonya disconnected — using NSE delayed data and stored history")
 
     def closeEvent(self, event):
+        self.ticker.close()
         self.broker.feed.close()
         super().closeEvent(event)
 
@@ -619,7 +658,9 @@ class MainWindow(QMainWindow):
 
     # ================================================================== live overview
     def poll_live(self):
-        if self.live.paused() or self.current_page() != "live" or self._flags["live"]:
+        """NSE snapshot: for the Live page, and for the menu-bar ticker while Shoonya is off."""
+        on_page = self.current_page() == "live" and not self.live.paused()
+        if self._flags["live"] or not (on_page or not self.broker.live):
             return
         self._flags["live"] = True
         self.runner.start(lambda _p: self.svc.live_snapshot(), self._live_done, self._live_failed)

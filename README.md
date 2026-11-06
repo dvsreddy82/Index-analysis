@@ -74,6 +74,12 @@ A left navigation rail groups the nine screens. **Ctrl+1 … Ctrl+9** jumps stra
 | My trading | **Trades & P&L** | Positions, orders, fills, history, performance, "why I lost", journal |
 | My trading | **AI coach** | Chat with a local LLM about your trades |
 
+**Menu-bar ticker (macOS):**
+* While the app runs, the macOS menu bar shows the live index, e.g. `BNF 57,669.30 ▼104.3 (−0.18%)` in green or red, updated every second. It uses Shoonya ticks, or NSE's snapshot every ~15 s when Shoonya isn't connected.
+* Click it for BANKNIFTY, NIFTY and India VIX with the day's high/low, your open P&L and the risk monitor's RED/AMBER count. A ⚠ count also appears in the bar itself when a RED alert is active.
+* From the same menu you can choose BANKNIFTY, NIFTY or both, hide the price, or open the app.
+* It needs `pyobjc-framework-Cocoa` (in requirements, macOS only). Elsewhere it falls back to a tray icon with the text in its tooltip.
+
 Each screen starts the same way: a title, a one-line purpose, then a toolbar for that screen's own controls. One **app bar** at the top is shared by all of them:
 * market open/closed and the IST clock;
 * the data source (real-time or NSE delayed);
@@ -129,6 +135,7 @@ Everything is stored in MongoDB as it arrives, so the screens keep working witho
 | `sync_service.py` | Background scheduler and `sync_log` |
 | `fii_analysis.py` / `fii_view.py` | FII/DII positioning engine / screen |
 | `risk_engine.py` / `risk_view.py` | Writer risk monitor: threat detectors, GEX, safe zones, leg guidance / screen |
+| `menubar.py` | Live index ticker in the macOS menu bar (PyObjC NSStatusItem; Qt tray fallback) |
 | `config.py` | All tunables (Mongo URI, symbols, thresholds); each can be overridden by an environment variable |
 | `db_handler.py` | MongoDB connection, JSON-schema validators, indexes, idempotent bulk upserts |
 | `data_fetcher.py` | NSE / Yahoo / NiftyTrader / Moneycontrol fetchers, participant-OI parser, `DataService` facade |
