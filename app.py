@@ -16,6 +16,10 @@ Data flows through services, not screens:
   trades_service           broker books → MongoDB → journal analytics
   sync_service             scheduled sync: FII/DII as published, EOD, intraday, chain snapshots
   fii_analysis             FII/DII positioning → option-writing read
+  watch_service            global markets, level-break alerts, 15-minute direction calls
+
+Shoonya is used in market hours only (broker.SESSION); outside them, and whenever it stops
+streaming, every screen falls back to NSE / Yahoo and the data stored in MongoDB.
 
 Run:  python app.py
 """
@@ -60,6 +64,10 @@ from banknifty_service import BankNiftyService
 from banknifty_view import BankNiftyDashboard
 from news_service import NewsService, market_window as news_market_window
 from news_view import NewsDashboard
+import market_watch as mw
+from watch_service import WatchService
+from watch_view import GlobalDashboard, SignalsDashboard
+from broker import in_session
 import risk_engine
 import trades_engine as te
 from api_server import ApiServer
@@ -260,8 +268,9 @@ class MainWindow(QMainWindow):
 
     NAV = [("MARKETS", [("live", "◉  Live overview"), ("banknifty", "▤  BANKNIFTY monitor"),
                         ("intraday", "◔  Intraday chart"),
-                        ("chain", "▦  Option chain"), ("risk", "⚠  Writer risk monitor"),
-                        ("fii", "⇅  FII / DII flows"), ("news", "✉  Market news")]),
+                        ("chain", "▦  Option chain"), ("signals", "➚  Direction & levels"),
+                        ("risk", "⚠  Writer risk monitor"), ("fii", "⇅  FII / DII flows"),
+                        ("global", "🌐  Global markets"), ("news", "✉  Market news")]),
            ("RESEARCH", [("analysis", "◇  Index analysis"), ("scanner", "☰  Scanner")]),
            ("MY TRADING", [("trades", "₹  Trades & P&L"), ("ai", "✦  AI coach")])]
 
@@ -283,6 +292,10 @@ class MainWindow(QMainWindow):
         self.sync_svc = SyncService(self.svc, self.broker, self.market, self.runner, self)
         self.bnf_svc = BankNiftyService(self.svc, self.broker, self.market)
         self.news_svc = NewsService(self.svc)
+        self.watch = WatchService(self.svc, self.options, self.market)
+        self._global_at = 0.0
+        self._snap_at = 0.0
+        self._lvl_slot = self._call_slot = None
         self._news_at = 0.0
         self._bnf_at = 0.0
         self.result: dict | None = None
@@ -316,6 +329,7 @@ class MainWindow(QMainWindow):
         self.broker.changed.connect(self._broker_state)
         self.broker.connected.connect(self._broker_connected)
         self.broker.disconnected.connect(self._broker_disconnected)
+        self.broker.session_closing.connect(self._session_closing)
         self.sync_svc.status_changed.connect(self._sync_state)
         self.sync_svc.fii_updated.connect(lambda _o: self.load_fii())
         self.sync_svc.eod_updated.connect(self._eod_done)
@@ -350,6 +364,12 @@ class MainWindow(QMainWindow):
         self.news_timer.timeout.connect(self.load_news)
         self.news_timer.start()
         QTimer.singleShot(8_000, lambda: self.load_news(force=True))
+        self.global_timer = QTimer(self)           # world markets: every 5 min, around the clock
+        self.global_timer.setInterval(60_000)
+        self.global_timer.timeout.connect(self.load_global)
+        self.global_timer.start()
+        QTimer.singleShot(6_000, lambda: self.load_global(force=True))
+        QTimer.singleShot(12_000, self.refresh_levels)
 
         self.ticker = MenuBarTicker(on_open=self._bring_to_front)   # live index price in the menu bar
         self._broker_state()
@@ -468,6 +488,15 @@ class MainWindow(QMainWindow):
         self.fii_view.zones_requested.connect(lambda: self._chains_due(force=True))
         self._add("fii", "FII / DII flows", "Institutional cash flows and F&O positioning → a direction for option "
                   "writing · synced automatically as NSE publishes (≈5–9 pm IST)", self.fii_view)
+        self.signals_view = SignalsDashboard()
+        self.signals_view.refresh_requested.connect(lambda: self.make_calls(manual=True))
+        self._add("signals", "Direction & levels", "A direction call for NIFTY and BANKNIFTY every 15 minutes from the "
+                  "option chain, with a writing idea · alerts when a key support or resistance breaks on a 5-min close",
+                  self.signals_view)
+        self.global_view = GlobalDashboard()
+        self.global_view.refresh_requested.connect(lambda: self.load_global(force=True))
+        self._add("global", "Global markets", "US, Asian and European indices, US futures, crude, dollar, yields, rupee "
+                  "and US VIX — what can move India's open · alerts on major moves", self.global_view)
         self.news_view = NewsDashboard()
         self.news_view.refresh_requested.connect(lambda: self.load_news(force=True))
         self._add("news", "Market news", "Headlines that can move NIFTY and BANKNIFTY — RBI, NSE bank filings and "
@@ -548,6 +577,11 @@ class MainWindow(QMainWindow):
             self.sync_trades(pull=self.broker.live)
         elif key == "risk":
             self.load_risk(force=time.time() - self._risk_at > 30)
+        elif key == "global":
+            self.load_global()
+        elif key == "signals":
+            self.refresh_levels()
+            self._render_signals()
         elif key == "fii" and len(self.fii_view.zone_res) < 2:
             self._chains_due(force=True)
 
@@ -569,6 +603,16 @@ class MainWindow(QMainWindow):
                 self._show_snapshot()
             self._rtc_tick()
         self._update_ticker()
+        if open_ and t.minute % 5 == 0 and t.second >= 3 and (t.hour, t.minute) >= (9, 20):
+            slot = f"{t:%Y-%m-%d %H:%M}"
+            if self._lvl_slot != slot:
+                self._lvl_slot = slot
+                self._check_levels(t)
+        if open_ and t.minute % 15 == 0 and t.second >= 8 and (9, 30) <= (t.hour, t.minute) <= (15, 15):
+            slot = f"{t:%Y-%m-%d %H:%M}"
+            if self._call_slot != slot:
+                self._call_slot = slot
+                self.make_calls(t.replace(second=0, microsecond=0, tzinfo=None))
 
     def _update_ticker(self):
         """Menu-bar ticker: Shoonya ticks when live, else the latest NSE snapshot."""
@@ -597,6 +641,9 @@ class MainWindow(QMainWindow):
             extra["book_at"] = f"{at:%H:%M}" if at else None
         res = self.risk_view.results.values()
         extra["setup"] = getattr(self, "_setup_active", None)
+        today = f"{now_ist():%Y-%m-%d}"
+        extra["direction"] = {u: c["dir"] for u, c in self.watch.calls.items() if c.get("day") == today}
+        extra["global_read"] = self.watch.cue.get("read")
         extra["red"] = sum(1 for r in res for a in r["alerts"] if a["level"] == "RED")
         extra["amber"] = sum(1 for r in res for a in r["alerts"] if a["level"] == "AMBER")
         self._ticker_state = (quotes, extra)          # also served to the phone app (/api/ticker)
@@ -610,7 +657,8 @@ class MainWindow(QMainWindow):
     def _broker_state(self):
         kind, text, color = self.broker.state()
         self.broker_btn.setText({"live": "● Shoonya live", "connecting": "… Connecting",
-                                 "degraded": "◐ Shoonya", "off": "Connect Shoonya"}[kind])
+                                 "degraded": "◐ Shoonya", "off": "Connect Shoonya",
+                                 "closed": "Shoonya · market closed"}[kind])
         self.broker_btn.setToolTip(text + (" — click to disconnect" if kind in ("live", "degraded") else
                                            " — read-only prices, chains and positions"))
         self.broker_btn.setStyleSheet(f"color:{color};font-weight:600" if kind != "off" else "")
@@ -634,6 +682,7 @@ class MainWindow(QMainWindow):
         busy = s["busy"]
         kind, text, color = self.broker.state()
         src = (f"<span style='color:{C['up']}'>● real-time</span>" if kind == "live" else
+               f"<span style='color:{C['muted']}'>● after hours · NSE / stored</span>" if kind == "closed" else
                f"<span style='color:{C['warn']}'>● NSE delayed</span>")
         self.fresh_lbl.setText(
             f"{src} &nbsp; <span style='color:{C['muted']}'>FII/DII <b style='color:{C['text']}'>{day(s['fii_cash'])}"
@@ -661,12 +710,22 @@ class MainWindow(QMainWindow):
 
     def _broker_disconnected(self):
         self.opt_timer.setInterval(config.OPTIONS_REFRESH_SECONDS * 1000)
-        self._status("Shoonya disconnected — using NSE delayed data and stored history")
+        self._status("Market closed — Shoonya closed; NSE and stored data in use" if not in_session() else
+                     "Shoonya disconnected — using NSE delayed data and stored history")
+        self.poll_live()
+
+    def _session_closing(self):
+        """End of the market-hours window: store the closing candles and chains, then close Shoonya."""
+        self._status("Market-hours window over — storing closing candles, then closing Shoonya")
+        self._chains_due(force=True)
+        self.sync_svc.run_intraday(full=True, then=lambda: QTimer.singleShot(30_000, self.broker.end_session))
 
     def _api_need(self, what: str):
         """A phone request found stale data: refresh it on the GUI thread."""
         if what == "banknifty":
             self.load_banknifty()
+        elif what == "global":
+            self.load_global(force=True)
         elif what == "risk":
             self.load_risk(force=True)
         elif what == "trades":
@@ -746,7 +805,7 @@ class MainWindow(QMainWindow):
     def poll_live(self):
         """NSE snapshot: for the Live page, and for the menu-bar ticker while Shoonya is off."""
         on_page = self.current_page() == "live" and not self.live.paused()
-        if self._flags["live"] or not (on_page or not self.broker.live):
+        if self._flags["live"] or not (on_page or not self.broker.healthy):
             return
         self._flags["live"] = True
         self.runner.start(lambda _p: self.svc.live_snapshot(), self._live_done, self._live_failed)
@@ -757,6 +816,7 @@ class MainWindow(QMainWindow):
             self.live.ts.setText("NSE live feed unavailable — retrying")
             return
         self._last_snap = snap
+        self._snap_at = time.time()
         self._show_snapshot()
 
     def _live_failed(self, err: str):
@@ -989,6 +1049,166 @@ class MainWindow(QMainWindow):
 
         self.runner.start(job, done, failed)
 
+    # ================================================================== global markets
+    def load_global(self, force: bool = False):
+        if self._flags.get("global") or (not force and time.time() - self._global_at < 300):
+            return
+        self._flags["global"] = True
+        self._global_at = time.time()
+        w = self.watch
+
+        def job(_p):
+            quotes, new = w.poll_global()
+            return quotes, new, w.recent_alerts(1, ("GLOBAL",))
+
+        def done(out):
+            self._flags["global"] = False
+            quotes, new, recent = out
+            self.global_view.set_data(quotes, w.cue, recent)
+            n = sum(1 for q in quotes if not q.get("offline"))
+            fail = (f" · <span style='color:{C['warn']}'>unavailable: {', '.join(w.failed[:4])}"
+                    f"{'…' if len(w.failed) > 4 else ''}</span>" if w.failed else "")
+            self.global_view.set_status(f"Checked {datetime.now():%H:%M:%S} · {n}/{len(mw.GLOBAL)} markets live"
+                                        f"{' · showing stored quotes (offline)' if not n and quotes else ''} · "
+                                        f"open read <b>{w.cue.get('read', '—')}</b> ({w.cue.get('score', 0):+d}){fail}")
+            self._raise(new, "🌐 Global markets")
+            self._preopen_cue()
+
+        def failed(err):
+            self._flags["global"] = False
+            self.global_view.set_status(f"<span style='color:{C['down']}'>Global markets check failed: "
+                                        f"{html.escape(err.splitlines()[0])}</span>")
+
+        self.runner.start(job, done, failed)
+
+    def _preopen_cue(self):
+        """Once each weekday between 8:30 and 9:15 am: the global read for the open."""
+        t = now_ist()
+        if t.weekday() >= 5 or not ((8, 30) <= (t.hour, t.minute) < (9, 15)) or not self.watch.quotes:
+            return
+        day = f"{t:%Y-%m-%d}"
+        if (self.sync_svc.last.get("preopen_cue") or {}).get("day") == day:
+            return
+        c = self.watch.cue
+        msg = (f"{c['read']} ({c['score']:+d}) · " + "; ".join(c.get("drivers", [])[:4]) + f" · {c['writer']}")
+        self.sync_svc._record("preopen_cue", True, msg, {"day": day})
+        self._status("🌐 Before the open: " + msg)
+        notify("🌐 Before the open — global read", msg, sound=abs(c["score"]) >= 25)
+
+    def _raise(self, alerts: list[dict], prefix: str):
+        """Mac notification + status line for new alerts (one combined banner when there are many)."""
+        if not alerts:
+            return
+        high = any(a.get("level") == "HIGH" for a in alerts)
+        if len(alerts) <= 2:
+            for a in alerts:
+                notify(f"{prefix} · {a['title']}", a["text"], sound=a.get("level") == "HIGH")
+        else:
+            notify(f"{prefix} · {len(alerts)} alerts", " · ".join(a["title"] for a in alerts[:6]), sound=high)
+        self._status(f"{prefix}: " + " · ".join(a["title"] for a in alerts[:4]))
+        if high:
+            QApplication.alert(self)
+
+    # ================================================================== levels & direction calls
+    def refresh_levels(self):
+        if self._flags.get("levels"):
+            return
+        self._flags["levels"] = True
+        quotes = (getattr(self, "_ticker_state", ({}, {}))[0]) or {}
+        spots = {und: (quotes.get(sym) or {}).get("last") for und, sym in (("NIFTY", "^NSEI"),
+                                                                             ("BANKNIFTY", "NIFTY BANK"))}
+        w = self.watch
+
+        def job(_p):
+            for und, sp in spots.items():
+                try:
+                    w.refresh_levels(und, sp)
+                except Exception as exc:
+                    log.warning("Levels for %s failed: %s", und, exc)
+
+        def done(_o):
+            self._flags["levels"] = False
+            self._render_signals()
+
+        def failed(err):
+            self._flags["levels"] = False
+            log.warning("Level refresh failed: %s", err.splitlines()[0])
+
+        self.runner.start(job, done, failed)
+
+    def _check_levels(self, t):
+        """Every 5-minute close in market hours: crossings of today's levels."""
+        quotes = (getattr(self, "_ticker_state", ({}, {}))[0]) or {}
+        if not self.broker.healthy and time.time() - self._snap_at > 150:
+            log.info("Level check skipped at %s: no fresh price (Shoonya not streaming, NSE snapshot stale)", t)
+            self.poll_live()
+            self.refresh_levels()
+            return
+        new = []
+        for und, sym in (("NIFTY", "^NSEI"), ("BANKNIFTY", "NIFTY BANK")):
+            q = quotes.get(sym) or {}
+            if not q.get("last"):
+                continue
+            first = und not in self.watch.watcher.prev or self.watch.watcher.day != t.date()
+            prev = q.get("prev") if (t.hour, t.minute) <= (9, 20) else None   # gap breaks only at the first close
+            new += self.watch.check_levels(und, q["last"], prev if first else None)
+        self._raise(new, "📉 Level break")
+        self.refresh_levels()                     # chain walls drift: rebuild for the next close
+
+    def make_calls(self, slot=None, manual: bool = False):
+        if self._flags.get("calls"):
+            return
+        self._flags["calls"] = True
+        slot = slot or now_ist().replace(second=0, microsecond=0, tzinfo=None)
+        risk = {u: dict(r) for u, r in self.risk_view.results.items()}
+        w = self.watch
+        if manual:
+            self.signals_view.set_status("Making a direction call…")
+
+        def job(_p):
+            out = {}
+            for und in ("NIFTY", "BANKNIFTY"):
+                try:
+                    out[und] = w.make_call(und, slot, risk.get(und))
+                except Exception as exc:
+                    out[und] = {"error": str(exc)}
+            return out
+
+        def done(out):
+            self._flags["calls"] = False
+            ok = {u: c for u, c in out.items() if "error" not in c}
+            errs = [f"{u}: {c['error']}" for u, c in out.items() if "error" in c]
+            self._render_signals()
+            self.signals_view.set_status(f"Last call {slot:%H:%M}" + (" (manual)" if manual else "")
+                                         + " · next on the quarter hour, 9:30 am – 3:15 pm"
+                                         + (f" · <span style='color:{C['down']}'>{html.escape('; '.join(errs))}</span>"
+                                            if errs else ""))
+            if not ok:
+                return
+            title = f"➚ Direction {slot:%H:%M} · " + " · ".join(f"{u} {c['dir']}" for u, c in ok.items())
+            text = " | ".join(f"{u} ({c['confidence']}, {c['score']:+d}): {c['idea']}" for u, c in ok.items())
+            self._status(title)
+            notify(title, text, sound=any(c.get("changed") for c in ok.values()))
+
+        def failed(err):
+            self._flags["calls"] = False
+            self.signals_view.set_status(f"<span style='color:{C['down']}'>Direction call failed: "
+                                         f"{html.escape(err.splitlines()[0])}</span>")
+
+        self.runner.start(job, done, failed)
+
+    def _render_signals(self):
+        quotes = (getattr(self, "_ticker_state", ({}, {}))[0]) or {}
+        w = self.watch
+        for und, sym in (("NIFTY", "^NSEI"), ("BANKNIFTY", "NIFTY BANK")):
+            col = self.signals_view.cols[und]
+            col.set_call(w.latest_call(und))
+            spot = (quotes.get(sym) or {}).get("last") or (w.latest_call(und) or {}).get("spot")
+            col.set_levels(w.levels.get(und) or [], w.level_status(und), spot)
+            calls = w.today_calls(und)
+            col.set_history(calls, w.hit_rate(calls))
+        self.signals_view.set_alerts(w.recent_alerts(1, ("LEVEL",)))
+
     # ================================================================== writer risk monitor
     def load_risk(self, force: bool = False):
         """Every 30 s on the screen; every 3 min in the background while Shoonya is live in
@@ -999,7 +1219,7 @@ class MainWindow(QMainWindow):
         if not force:
             if not self.risk_view.auto.isChecked():
                 return
-            every = 30 if visible else (180 if self.broker.live and market_open() else None)
+            every = 30 if visible else (180 if market_open() else None)
             if every is None or time.time() - self._risk_at < every:
                 return
         self._flags["risk"] = True

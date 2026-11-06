@@ -12,8 +12,9 @@ in the `sync_log` collection and the app bar shows the freshness:
 * intraday  — every 5 min while Shoonya is connected: 1-minute candles for
               every instrument Shoonya streams (backfills ~9 days the first
               time), plus 15m / 1H candles once an hour.
-* chains    — every 5 min in market hours while connected: NIFTY and
-              BANKNIFTY option-chain snapshots (via the options service).
+* chains    — every 5 min in market hours: NIFTY and BANKNIFTY option-chain
+              snapshots (via the options service: Shoonya when it is streaming,
+              NSE otherwise).
 """
 from __future__ import annotations
 
@@ -108,7 +109,7 @@ class SyncService(QObject):
         if self.broker.live and (market_open(t) or (self.age("intraday") or 1e9) > 3600):
             if time.time() - self._attempt.get("intraday", 0) > 5 * 60:
                 self.run_intraday(full=(self.age("intraday_full") or 1e9) > 3600)
-        if self.broker.live and market_open(t) and time.time() - self._attempt.get("chains", 0) > 5 * 60:
+        if market_open(t) and time.time() - self._attempt.get("chains", 0) > 5 * 60:
             self._attempt["chains"] = time.time()
             self.chains_due.emit()
 
@@ -174,8 +175,11 @@ class SyncService(QObject):
         self.runner.start(lambda p: self.svc.sync(symbols=symbols, progress=p), done, failed,
                           progress or self.progress.emit)
 
-    def run_intraday(self, full: bool = False):
+    def run_intraday(self, full: bool = False, then=None):
+        """`then` runs after the job either way (used to close Shoonya after the closing pull)."""
         if "intraday" in self.busy or not self.broker.live:
+            if then:
+                then()
             return
         self.busy.add("intraday")
         self._attempt["intraday"] = time.time()
@@ -197,10 +201,14 @@ class SyncService(QObject):
             self._record("intraday", True, f"{n} instruments · 1m" + (" + 15m/1H" if full else ""))
             if full:
                 self._record("intraday_full", True, f"{n} instruments")
+            if then:
+                then()
 
         def failed(err):
             self.busy.discard("intraday")
             self._record("intraday", False, err.splitlines()[0][:200])
+            if then:
+                then()
 
         self.runner.start(job, done, failed)
 

@@ -5,12 +5,20 @@ redirect catcher), today's saved session, and the connection state.  Screens
 never connect on their own: they read `broker.feed` and listen to
 `broker.changed` (any state change), `broker.connected` and
 `broker.disconnected`.  Read-only: no order route is ever called.
+
+Shoonya is used only in market hours (weekdays 9:00 am – 3:40 pm IST, pre-open included):
+today's saved session connects by itself when the window opens, and the connection is
+closed after the window (once the closing candles are stored).  Outside the window every
+screen uses NSE / Yahoo and the data stored in MongoDB.  A manual connect after hours is
+still possible (e.g. to pull positions) and is left alone.  In market hours a connection
+whose index ticks stop arriving is reported as degraded (`healthy` is False), and the
+screens fall back to NSE until ticks resume.
 """
 from __future__ import annotations
 
 import html
 import logging
-from datetime import date
+from datetime import date, time as dtime
 
 from PySide6.QtCore import QObject, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
@@ -19,16 +27,25 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBo
 
 from shoonya_feed import (REDIRECT_URL, OAuthCatcher, ShoonyaFeed, code_from_text, from_env, load_settings,
                           save_settings, totp_now)
+from sync_service import market_open, now_ist
 from tasks import Runner
 from theme import C, label
 
 log = logging.getLogger(__name__)
+
+SESSION = (dtime(9, 0), dtime(15, 40))          # when Shoonya is used (IST, weekdays)
+
+
+def in_session(t=None) -> bool:
+    t = t or now_ist()
+    return t.weekday() < 5 and SESSION[0] <= t.time() <= SESSION[1]
 
 
 class Broker(QObject):
     changed = Signal()            # state or status text changed
     connected = Signal(str)       # connection message
     disconnected = Signal()
+    session_closing = Signal()    # the market-hours window ended: store the closing data, then end_session()
 
     def __init__(self, runner: Runner, parent=None):
         super().__init__(parent)
@@ -39,22 +56,62 @@ class Broker(QObject):
         self._watch = QTimer(self)                 # websocket reconnects change the status text
         self._watch.timeout.connect(self._poll_state)
         self._watch.start(2000)
+        self._manual_after_hours = False          # connected by hand outside the window: leave it
+        self._user_off: date | None = None        # disconnected by hand today: no auto-reconnect
+        self._closing = False
+        self._session = QTimer(self)
+        self._session.timeout.connect(self._session_tick)
+        self._session.start(60_000)
 
     # ---------------------------------------------------------------- state
     @property
     def live(self) -> bool:
         return self.feed.live
 
+    @property
+    def healthy(self) -> bool:
+        """Connected and actually streaming: an index tick in the last 30 s (in market hours)."""
+        f = self.feed
+        if not f.live:
+            return False
+        if not market_open():
+            return True
+        from shoonya_feed import INDEX_TOKENS
+        return any(f._fresh(f.tick(INDEX_TOKENS[s])) for s in ("NIFTY BANK", "^NSEI"))
+
     def state(self) -> tuple[str, str, str]:
-        """(kind, short text, colour): kind is live / connecting / degraded / off."""
+        """(kind, short text, colour): kind is live / connecting / degraded / closed / off."""
         f = self.feed
         if self.busy:
             return "connecting", "Shoonya: connecting…", C["warn"]
+        if f.live and not self.healthy:
+            return "degraded", "Shoonya: no ticks — using NSE until they resume", C["warn"]
         if f.live:
             return "live", "Shoonya real-time", C["up"]
         if f.logged_in:
-            return "degraded", f"Shoonya: {f.status}", C["warn"]
-        return "off", "Shoonya: not connected", C["muted"]
+            return "degraded", f"Shoonya: {f.status} — using NSE", C["warn"]
+        if not in_session():
+            return "closed", "Market closed — NSE / stored data (Shoonya is used 9:00–15:40)", C["muted"]
+        return "off", "Shoonya: not connected — using NSE", C["muted"]
+
+    # ---------------------------------------------------------------- market-hours window
+    def _session_tick(self):
+        if in_session():
+            self._closing = False
+            self._manual_after_hours = False
+            if not (self.busy or self.feed.live or self.feed.logged_in) and self._user_off != date.today():
+                self.auto_connect()
+        elif (self.feed.live or self.feed.logged_in) and not self._manual_after_hours and not self._closing:
+            self._closing = True
+            log.info("Market-hours window over: storing closing data, then closing Shoonya")
+            self.session_closing.emit()
+            QTimer.singleShot(5 * 60_000, self.end_session)           # in case the closing jobs never report
+
+    def end_session(self):
+        if (self.feed.live or self.feed.logged_in) and not in_session() and not self._manual_after_hours:
+            self.feed.close()
+            self.disconnected.emit()
+            self._poll_state()
 
     def _poll_state(self):
         s = self.state()
@@ -72,12 +129,16 @@ class Broker(QObject):
         self.connect(parent)
 
     def disconnect(self):
+        self._user_off = date.today()
         self.feed.close()
         self.disconnected.emit()
         self._poll_state()
 
     def auto_connect(self):
-        """At start-up: reuse today's saved session silently (no browser, no dialogs)."""
+        """Reuse today's saved session silently (no browser, no dialogs) — market hours only."""
+        if not in_session():
+            log.info("Outside market hours: Shoonya not connected (NSE / stored data in use)")
+            return
         s = load_settings()
         if s.get("access_token") and s.get("token_date") == date.today().isoformat():
             self._run(s, token=s["access_token"], remember=True, parent=None, silent=True)
@@ -85,6 +146,13 @@ class Broker(QObject):
     def connect(self, parent):
         if self.busy:
             return
+        if not in_session():
+            if QMessageBox.question(parent, "Shoonya", "The market is closed, so prices come from NSE and the data "
+                                    "stored in MongoDB — Shoonya isn't needed.\n\nConnect anyway (for example to "
+                                    "pull your positions)?") != QMessageBox.StandardButton.Yes:
+                return
+            self._manual_after_hours = True
+        self._user_off = None
         s = load_settings()
         if s.get("access_token") and s.get("token_date") == date.today().isoformat():
             self._run(s, token=s["access_token"], remember=True, parent=parent, retry_signin=True)

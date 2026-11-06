@@ -51,9 +51,10 @@ class OptionsService:
         feed = self.broker.feed
         expiries = self._expiry_list(underlying)
         exp = pick_expiry(expiries, expiry or None)
-        spot = float((feed.tick(INDEX_TOKENS[SPOT_SYMBOL[underlying]]) or {}).get("lp") or 0)
+        t = feed.tick(INDEX_TOKENS[SPOT_SYMBOL[underlying]])
+        spot = float((t or {}).get("lp") or 0) if feed._fresh(t) else 0
         if not spot:
-            raise RuntimeError("no live index tick yet")
+            raise RuntimeError("no fresh index tick")
         first = (underlying, exp) not in feed.chains
         feed.ensure_chain(underlying, exp, spot, STEP[underlying])
         for _ in range(30 if first else 0):           # let the first ticks arrive

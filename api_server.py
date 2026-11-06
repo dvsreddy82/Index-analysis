@@ -19,6 +19,8 @@ Endpoints (all GET, JSON):
   /api/fii         FII/DII read, evening setup, strike zones, signals, recent sessions
   /api/positions   open positions with management alerts, today's P&L, margin
   /api/news        relevant headlines (?hours=&impact=HIGH&tag=BANKNIFTY&limit=)
+  /api/global      world indices, US futures, crude, dollar, yields, rupee, US VIX + the read for India's open
+  /api/signals     NIFTY / BANKNIFTY: latest 15-minute direction call, today's calls, key levels, level breaks
   /api/alerts      every active alert with a stable id (the phone notifies on new ids)
 """
 from __future__ import annotations
@@ -105,6 +107,10 @@ def _clean(o):
     return o
 
 
+def _alert_out(a: dict) -> dict:
+    return {k: a.get(k) for k in ("id", "kind", "level", "title", "text", "raised_at", "und", "direction")}
+
+
 def _id(*parts) -> str:
     return hashlib.sha1("|".join(str(p) for p in parts).encode()).hexdigest()[:12]
 
@@ -159,7 +165,8 @@ class ApiServer(QObject):
         route = {"/api/health": self.health, "/api/ticker": self.ticker, "/api/overview": self.overview,
                  "/api/banknifty": self.banknifty, "/api/chain": self.chain, "/api/risk": self.risk,
                  "/api/fii": self.fii, "/api/positions": self.positions, "/api/alerts": self.alerts,
-                 "/api/news": self.news}.get(url.path)
+                 "/api/news": self.news, "/api/global": self.global_markets,
+                 "/api/signals": self.signals}.get(url.path)
         if route is None:
             return self._send(h, 404, {"error": "unknown endpoint"})
         try:
@@ -319,6 +326,33 @@ class ApiServer(QObject):
                 "alerted", "related")
         return {"items": [{k: d.get(k) for k in keep} for d in items], "status": self.win.news_svc.status}
 
+    def global_markets(self, _q):
+        w = self.win.watch
+        if not w.quotes:
+            self.need.emit("global")
+        keep = ("key", "name", "group", "unit", "threshold", "last", "prev", "chg", "pct", "move", "at", "session",
+                "stale", "offline", "spark")
+        return {"quotes": [{k: q.get(k) for k in keep} for q in w.quotes], "cue": w.cue,
+                "checked_at": w.global_at, "failed": w.failed,
+                "alerts": [_alert_out(a) for a in w.recent_alerts(1, ("GLOBAL",))]}
+
+    def signals(self, _q):
+        w = self.win.watch
+        quotes = (getattr(self.win, "_ticker_state", ({}, {}))[0]) or {}
+        out = {}
+        for und, sym in (("NIFTY", "^NSEI"), ("BANKNIFTY", "NIFTY BANK")):
+            calls = w.today_calls(und)
+            right, n = w.hit_rate(calls)
+            st = w.level_status(und)
+            spot = (quotes.get(sym) or {}).get("last")
+            out[und] = {"spot": spot, "call": w.latest_call(und),
+                        "calls": [{k: c.get(k) for k in ("slot", "dir", "direction", "score", "confidence", "spot",
+                                                         "spot_after", "outcome")} for c in calls],
+                        "hits": right, "graded": n,
+                        "levels": [{"name": m["name"], "also": m.get("also", []), "price": m["price"],
+                                    "status": st.get(round(m["price"]))} for m in w.levels.get(und) or []]}
+        return {**out, "alerts": [_alert_out(a) for a in w.recent_alerts(1, ("LEVEL",))], "time": datetime.now()}
+
     def alerts(self, _q):
         """Every active alert with a stable id; the phone raises a notification for unseen ids."""
         items = []
@@ -350,6 +384,19 @@ class ApiServer(QObject):
                               "title": "Market news · " + "/".join(t for t in d.get("tags", [])
                                                                    if t in ("BANKNIFTY", "NIFTY", "RBI", "MACRO")),
                               "text": d["title"] + extra, "link": d.get("link")})
+        w = self.win.watch
+        for a in w.recent_alerts(1, ("GLOBAL", "LEVEL")):
+            ts = pd.Timestamp(a["raised_at"])
+            age = (pd.Timestamp.now(tz="UTC") - (ts.tz_convert("UTC") if ts.tzinfo else ts.tz_localize("UTC"))).total_seconds()
+            if age < (12 if a["kind"] == "GLOBAL" else 3) * 3600:
+                items.append({"id": a["id"], "level": a["kind"], "source": "Global markets" if a["kind"] == "GLOBAL"
+                              else "Level break", "title": a["title"], "text": a["text"], "severity": a.get("level")})
+        for und in ("NIFTY", "BANKNIFTY"):
+            c = w.latest_call(und)
+            if c and c.get("day") == str(date.today()):
+                items.append({"id": _id("dir", und, c["slot"]), "level": "DIRECTION", "source": "Direction call",
+                              "title": f"{und} {c['slot'][-5:]} · {c['direction']} ({c['confidence']})",
+                              "text": c["idea"], "dir": c["dir"], "changed": bool(c.get("changed"))})
         return {"alerts": items, "time": datetime.now()}
 
 

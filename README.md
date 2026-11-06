@@ -60,7 +60,7 @@ plus the ETFs that track them.
 ## 1. Architecture
 
 ### Screens
-A left navigation rail groups the ten screens. **Ctrl+1 … Ctrl+9** jumps straight to the first nine.
+A left navigation rail groups the twelve screens. **Ctrl+1 … Ctrl+9** jumps straight to the first nine.
 
 | Group | Screen | What it is for |
 |---|---|---|
@@ -68,8 +68,10 @@ A left navigation rail groups the ten screens. **Ctrl+1 … Ctrl+9** jumps strai
 | Markets | **BANKNIFTY monitor** | BANKNIFTY and its 14 banks: weights, live prices, points each bank adds, heatmap, breadth, VWAP, relative volume, alerts |
 | Markets | **Intraday chart** | NIFTY 50 / BANKNIFTY TradingView-style candles, indicators, levels, drawings, alerts |
 | Markets | **Option chain** | NIFTY / BANKNIFTY chain, OI and IV charts, option-selling analysis |
+| Markets | **Direction & levels** | Every 15 min in market hours: a BULLISH / BEARISH / SIDEWAYS call for NIFTY and BANKNIFTY from the option chain, with a writing idea, graded at the next call · today's key levels and alerts when one breaks |
 | Markets | **Writer risk monitor** | Squeeze / put-flush / divergence / negative-gamma alerts with prohibitions, safe zones and guidance for your legs |
 | Markets | **FII / DII flows** | Institutional positioning → option-writing direction and strike zones |
+| Markets | **Global markets** | US / Asian / European indices, US futures, crude, dollar, US 10Y, USD/INR and US VIX, the read for India's open, alerts on major moves |
 | Markets | **Market news** | Headlines that can move NIFTY / BANKNIFTY (RBI, NSE bank filings, market news), rated by impact, with alerts |
 | Research | **Index analysis** | Zones, pivots, volume profile and decision card for any index or ETF |
 | Research | **Scanner** | Daily analysis of all 56 instruments in one table |
@@ -111,8 +113,17 @@ Each screen starts the same way: a title, a one-line purpose, then a toolbar for
   app.py (shell: app bar, navigation, wiring)  +  one *_view.py per screen
 ```
 
+### Alerts for the option writer
+Each alert is a macOS notification and is also sent to the phone app:
+* **Level breaks** (NIFTY / BANKNIFTY, market hours): previous-day high / low, the 9:15–9:30 opening range, the daily support / resistance zones and the option-chain walls (largest put OI below spot, largest call OI above). A break needs a 5-minute close 0.05% through the level; each level alerts once a day per direction and re-arms when price closes back across it. The alert names the next level and what it means for short puts / calls.
+* **15-minute direction calls** (9:30 am – 3:15 pm): the chain now vs ~15 min ago (OI added within ±5 strikes of ATM, near-ATM PCR, put / call wall shifts, ATM IV), spot momentum, total PCR, the daily trend, today's level breaks and, on expiry day, max pain. A score of +3 or more is BULLISH, −3 or less BEARISH, otherwise SIDEWAYS, with a strike idea (beyond the OI wall and ~0.8σ). Every call is stored and graded at the next one, so the hit rate shows on the screen. Sound only when the direction changes.
+* **Global markets** (around the clock, every 5 min): a move past an instrument's threshold (e.g. S&P 500 futures 0.8%, Nikkei 1.5%, Brent 3%, USD/INR 0.5%, US 10Y 10 bps), again at 2× and 3×, and a broad-move alert when 4+ markets move ≥1% the same way. At 8:30–9:15 am on weekdays, a "before the open" summary.
+* Also: RED writer-risk alerts, the evening FII/DII setup, BANKNIFTY breadth, EXIT checks on positions and HIGH-impact news.
+
 ### Where Shoonya is used
-Shoonya is used for everything it provides; the public sources fill the rest:
+Shoonya is used **in market hours only** (weekdays 9:00 am – 3:40 pm IST, pre-open included). Today's saved session connects by itself when the window opens; after 3:40 pm the closing candles and chains are stored and the connection is closed. Outside the window, and whenever Shoonya stops streaming (no index tick for 30 s), every screen uses NSE / Yahoo and the data stored in MongoDB. You can still connect by hand after hours (for example to pull positions); the app asks first.
+
+Within market hours, Shoonya is used for everything it provides; the public sources fill the rest:
 * **Live quotes:**
   * Shoonya ticks for the six indices it streams (NIFTY 50, BANKNIFTY, Next 50, Fin Service, Midcap Select, India VIX) and every tracking ETF. That's 27 instruments.
   * The other ~28 indices come from NSE's snapshot, polled every 15 s, because Shoonya has no feed for them. Token range 26000–26400 was checked.
@@ -144,6 +155,7 @@ Everything is stored in MongoDB as it arrives, so the screens keep working witho
 | `banknifty_service.py` / `banknifty_view.py` | BANKNIFTY constituents: list, weight fit, live picture, alerts / screen |
 | `api_server.py` | Read-only JSON API for the Android companion app (token-protected) |
 | `news_service.py` / `news_view.py` | Market news: fetch, filter, rate, dedupe, alert / screen |
+| `market_watch.py` / `watch_service.py` / `watch_view.py` | Global markets, level breaks and 15-minute direction calls: engines / state + MongoDB / the two screens |
 | `menubar.py` | Live index ticker in the macOS menu bar (PyObjC NSStatusItem; Qt tray fallback) |
 | `packaging/` | macOS app build: PyInstaller spec, `build_mac.sh` (.app + .dmg), icon |
 | `config.py` | All tunables (Mongo URI, symbols, thresholds); each can be overridden by an environment variable |
@@ -165,6 +177,9 @@ Everything is stored in MongoDB as it arrives, so the screens keep working witho
 | `option_chain_snapshots` | unique `(underlying, expiry, ts)` | spot, source, NSE-shaped chain rows (OI, change, LTP, bid/ask, volume) every 5 min |
 | `broker_positions` | unique `date` | the day's Shoonya position book (offline copy) |
 | `sync_log` | unique `job` | last run, outcome and latest FII/DII dates per sync job |
+| `global_quotes` | unique `(key, session)` | latest quote of each world market per session (offline copy) |
+| `market_alerts` | unique `id` | every GLOBAL / LEVEL alert raised (an id alerts once) |
+| `direction_calls` | unique `(und, slot)` | each 15-minute call: direction, score, signals, idea, spot, and the grade at the next call |
 
 Every write is an `UpdateOne(..., upsert=True)` keyed on the natural key, so running a sync again never duplicates data. FII cash and participant-OI records for the same date are merged with `$set`.
 
