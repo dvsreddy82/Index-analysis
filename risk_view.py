@@ -45,6 +45,10 @@ class RiskColumn(QWidget):
         self.directives = label()
         l.addWidget(self.directives)
         lay.addWidget(f)
+        f, l = card(f"{name} · 4. Your book — Greeks, stress test, expiry odds")
+        self.book = label(f"<span style='color:{C['muted']}'>No open positions in {name}.</span>")
+        l.addWidget(self.book)
+        lay.addWidget(f)
         lay.addStretch(1)
 
     def set_error(self, msg: str):
@@ -97,6 +101,43 @@ class RiskColumn(QWidget):
                                 + sec("Safe / permissible zones (beyond 0.10Δ and 1.5× expected move)", r["safe"],
                                       C["up"])
                                 + sec("Existing position guidance", r["positions"], C["accent"]))
+        self.book.setText("".join(book_html(b) for b in r.get("books") or []) or
+                          f"<span style='color:{C['muted']}'>No open positions here.</span>")
+        for lbl in (self.matrix, self.alerts, self.directives, self.book):
+            w = lbl.width() if lbl.width() > 50 else max(self.width() - 30, 300)
+            lbl.setMinimumHeight(max(lbl.heightForWidth(w), 0))
+
+
+def _rs(v) -> str:
+    if v is None:
+        return "unlimited"
+    return f"<span style='color:{C['up'] if v >= 0 else C['down']}'>₹{v:+,.0f}</span>"
+
+
+def book_html(b: dict) -> str:
+    mut = C["muted"]
+    hdr = "".join(f"<td align='right' style='color:{mut}'>{m * 100:+.0f}%</td>" for m in b["moves"])
+    rows = "".join(f"<tr><td style='color:{mut}'>{_esc(g['label'])}</td>"
+                   + "".join(f"<td align='right'>{_rs(v)}</td>" for v in g["pnl"]) + "</tr>" for g in b["grid"])
+    ns = b.get("nearest_short") or {}
+    cap = f"{b['captured'] * 100:+.0f}%" if b.get("captured") is not None else "—"
+    return (f"<div style='margin-top:4px'><b>{_esc(b['und'])} {_esc(b['expiry'])}</b> "
+            f"<span style='color:{mut}'>· {_esc(b.get('structure') or '')} · {b['dte']:.0f} DTE · credit "
+            f"₹{b['credit']:,} · P&L now {_rs(b['pnl_now'])} ({cap} captured)</span></div>"
+            f"<table cellspacing='0' cellpadding='2'>"
+            f"<tr><td style='color:{mut}'>Net delta</td><td><b>{b['delta']:+,.0f}</b> units ({b['delta_lots']:+.1f} lots) "
+            f"→ {_rs(b['per_100'])} per +100 pts</td></tr>"
+            f"<tr><td style='color:{mut}'>Theta / Vega</td><td>{_rs(b['theta'])} per day · {_rs(b['vega'])} per IV point"
+            f" · gamma {b['gamma']:+.3f}</td></tr>"
+            f"<tr><td style='color:{mut}'>At expiry</td><td>breakeven {', '.join(f'{x:,}' for x in b['breakevens']) or '—'}"
+            f" · max profit {_rs(b['max_profit'])} · max loss {_rs(b['max_loss'])}</td></tr>"
+            f"<tr><td style='color:{mut}'>Expiry odds</td><td><b>{b['pop']}%</b> chance of profit (implied vol "
+            f"{b['atm_iv']:.1f}%) · expected {_rs(b['expected_pnl'])} · if unchanged {_rs(b['pnl_expiry_spot'])} · "
+            f"±1σ ({b['sigma_pts']:,} pts): {_rs(b['pnl_expiry_dn1s'])} / {_rs(b['pnl_expiry_up1s'])}</td></tr>"
+            + (f"<tr><td style='color:{mut}'>Nearest short</td><td>{ns['strike']:,.0f} {ns['kind']} at "
+               f"{ns['sigma_away']:+.2f}σ from spot</td></tr>" if ns else "")
+            + f"</table><div style='color:{mut};margin-top:4px'>P&L if the index moves now:</div>"
+            f"<table cellspacing='0' cellpadding='2'><tr><td></td>{hdr}</tr>{rows}</table>")
 
 
 class RiskDashboard(QWidget):
@@ -121,6 +162,10 @@ class RiskDashboard(QWidget):
         b.clicked.connect(self.refresh_requested.emit)
         hl.addWidget(b)
         outer.addWidget(bar)
+        self.account = label(f"<span style='color:{C['muted']}'>Account limits appear once positions are synced.</span>")
+        f, l = card()
+        l.addWidget(self.account)
+        outer.addWidget(f)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -145,6 +190,20 @@ class RiskDashboard(QWidget):
     def set_result(self, und: str, r: dict):
         self.results[und] = r
         self.cols[und].set_result(r)
+
+    def set_account(self, a: dict):
+        mut = C["muted"]
+        alerts = "".join(f"<div><b style='color:{C['down'] if x['level'] == 'RED' else C['warn']}'>{_esc(x['title'])}"
+                         f"</b> <span style='color:{mut}'>{_esc(x['text'])}</span></div>" for x in a["alerts"])
+        use = f"{a['margin_use_pct']:.0f}%" if a.get("margin_use_pct") is not None else "—"
+        lim = f"₹{a['daily_limit']:,.0f}" if a.get("daily_limit") else "—"
+        self.account.setText(
+            f"<b>Account</b> <span style='color:{mut}'>"
+            + (f"capital ₹{a['capital']:,.0f} · " if a.get("capital") else "capital not synced yet (open Trades) · ")
+            + f"today {_rs(a['day_pnl'])}" + (f" (limit −{lim})" if a.get("daily_limit") else "")
+            + f" · margin in use {use} · all books on a 2% move now: down {_rs(a['move_2pct']['down'])}, "
+            f"up {_rs(a['move_2pct']['up'])} · theta {_rs(a['theta_day'])}/day · vega {_rs(a['vega'])}/IV pt</span>"
+            + alerts)
 
     def set_error(self, und: str, msg: str):
         self.cols[und].set_error(msg)

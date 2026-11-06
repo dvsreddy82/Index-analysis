@@ -124,6 +124,7 @@ class ApiServer(QObject):
         super().__init__()
         self.win = win
         self.key = api_key()
+        self._first_seen: dict[str, datetime] = {}
         self.httpd: ThreadingHTTPServer | None = None
         self.started_at = time.time()
         self._chain_locks = {"NIFTY": threading.Lock(), "BANKNIFTY": threading.Lock()}
@@ -278,7 +279,8 @@ class ApiServer(QObject):
                                           "alerts", "prohibitions", "safe", "positions", "call_wall", "put_wall",
                                           "atm_iv", "vix", "sigma", "window_min", "source", "timestamp")}
             out[und]["gex"] = {"net_cr": r["gex"]["net"] / 1e7, "flip": r["gex"].get("flip")}
-        return {"indices": out, "updated": self.win._risk_at}
+            out[und]["books"] = r.get("books") or []
+        return {"indices": out, "updated": self.win._risk_at, "account": getattr(self.win, "_account", None)}
 
     def fii(self, _q):
         from fii_analysis import strike_zones
@@ -362,6 +364,10 @@ class ApiServer(QObject):
                     items.append({"id": _id("risk", und, a["level"], a["title"]), "level": a["level"],
                                   "source": "Writer risk monitor", "title": f"{und}: {a['title']}",
                                   "text": " · ".join(a["signals"][:2]) + f" → {a['action']}"})
+        acc = getattr(self.win, "_account", None) or {}
+        for a in acc.get("alerts", []):
+            items.append({"id": _id("acct", date.today(), a["title"]), "level": a["level"], "source": "Account limits",
+                          "title": a["title"], "text": a["text"]})
         sync = self.win.sync_svc.last.get("setup_alert") or {}
         if getattr(self.win, "_setup_active", None) and sync.get("key"):
             items.append({"id": _id("setup", sync["key"]), "level": "SETUP", "source": "Evening setup",
@@ -397,6 +403,21 @@ class ApiServer(QObject):
                 items.append({"id": _id("dir", und, c["slot"]), "level": "DIRECTION", "source": "Direction call",
                               "title": f"{und} {c['slot'][-5:]} · {c['direction']} ({c['confidence']})",
                               "text": c["idea"], "dir": c["dir"], "changed": bool(c.get("changed"))})
+        # newest first: each alert carries the time it was raised (or first seen, for standing alerts)
+        now = datetime.now().astimezone()
+        news_at = {_id("news", d["id"]): d.get("alerted_at") or d.get("published")
+                   for d in self.win.news_svc.recent(hours=6, impact="HIGH", limit=40) if d.get("alerted")}
+        raised = {a["id"]: a.get("raised_at") for a in w.recent_alerts(1, ("GLOBAL", "LEVEL"))}
+        for it in items:
+            t = raised.get(it["id"]) or news_at.get(it["id"])
+            if it["level"] == "DIRECTION":
+                c = w.latest_call("BANKNIFTY" if it["title"].startswith("BANKNIFTY") else "NIFTY") or {}
+                t = c.get("at")
+            if t is None:
+                t = self._first_seen.setdefault(it["id"], now)
+            ts = pd.Timestamp(t)
+            it["at"] = (ts.tz_localize("UTC") if ts.tzinfo is None else ts).tz_convert(config.IST).isoformat()
+        items.sort(key=lambda x: x["at"], reverse=True)
         return {"alerts": items, "time": datetime.now()}
 
 

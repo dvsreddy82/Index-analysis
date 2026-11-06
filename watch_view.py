@@ -192,7 +192,7 @@ class SignalColumn(QWidget):
         """Box layouts ignore rich-text height-for-width; pin each label's height to its content."""
         for lbl in (self.call, self.levels, self.history):
             w = lbl.width() if lbl.width() > 50 else max(self.width() - 30, 300)
-            lbl.setMinimumHeight(lbl.heightForWidth(w))
+            lbl.setMinimumHeight(max(lbl.heightForWidth(w), 0))
 
     def resizeEvent(self, e):
         super().resizeEvent(e)

@@ -68,6 +68,7 @@ import market_watch as mw
 from watch_service import WatchService
 from watch_view import GlobalDashboard, SignalsDashboard
 from broker import in_session
+import book_risk
 import risk_engine
 import trades_engine as te
 from api_server import ApiServer
@@ -1225,6 +1226,9 @@ class MainWindow(QMainWindow):
         self._flags["risk"] = True
         self._risk_at = time.time()
         opts, svc, trades = self.options, self.svc, self.trades_svc
+        td = self.trades.data or {}
+        limits, today = dict(td.get("limits") or {}), dict(td.get("today") or {})
+        capital = config.TRADING_CAPITAL or float(limits.get("margin_used") or 0) + float(limits.get("available") or 0)
 
         def job(_p):
             fii = svc.load_fii_dii()
@@ -1253,12 +1257,34 @@ class MainWindow(QMainWindow):
                         except Exception as exc:
                             log.warning("risk: %s %s chain failed: %s", und, e, exc)
                     out[und] = risk_engine.assess(res, prev, path, frame, fii, legs, chains)
+                    books = []
+                    for g in groups:
+                        if g["und"] == und and any(l.get("qty") for l in g["legs"]):
+                            try:
+                                b = book_risk.assess_group(g, {res["expiry"]: res, **chains}, res.get("lot") or 1)
+                            except Exception as exc:
+                                log.warning("book risk %s failed: %s", und, exc)
+                                b = None
+                            if b:
+                                books.append(b)
+                    out[und]["books"] = books
+                    out[und]["alerts"] += [a for b in books for a in book_risk.book_alerts(b, capital)]
                 except Exception as exc:
                     out[und] = {"error": str(exc)}
             return out
 
         def done(out):
             self._flags["risk"] = False
+            books = [b for r in out.values() if "error" not in r for b in r.get("books", [])]
+            acc = book_risk.account_check(today, limits, books) if (limits or books) else None
+            self._account = acc
+            if acc:
+                self.risk_view.set_account(acc)
+                seen = getattr(self, "_acct_seen", set())
+                new = [a for a in acc["alerts"] if a["title"] not in seen]
+                self._acct_seen = {a["title"] for a in acc["alerts"]}
+                for a in new:
+                    notify(f"💼 Account · {a['title']}", a["text"], sound=a["level"] == "RED")
             reds = []
             for und, r in out.items():
                 if "error" in r:

@@ -149,6 +149,11 @@ OPTIONS_REFRESH_SECONDS: int = _env("OPTIONS_REFRESH_SECONDS", 60)
 TRADES_SYNC_SECONDS: int = _env("TRADES_SYNC_SECONDS", 30)     # Trades tab: broker book refresh
 TRADING_CAPITAL: float = _env("TRADING_CAPITAL", 0.0)          # 0 = use Shoonya's cash limit
 BROKERAGE_PER_ORDER: float = _env("BROKERAGE_PER_ORDER", 0.0)  # Shoonya: zero brokerage
+# book-risk limits (book_risk.py): % of capital (TRADING_CAPITAL, or margin used + available)
+DAILY_LOSS_LIMIT_PCT: float = _env("DAILY_LOSS_LIMIT_PCT", 2.0)    # stop adding risk past this day loss
+MOVE_LOSS_LIMIT_PCT: float = _env("MOVE_LOSS_LIMIT_PCT", 3.0)      # worst P&L of a book for a 4% move
+MAX_MARGIN_USE_PCT: float = _env("MAX_MARGIN_USE_PCT", 60.0)       # keep a buffer for gap margin calls
+BOOK_DELTA_LOTS: float = _env("BOOK_DELTA_LOTS", 3.0)              # net delta per book, in index lots
 # Statutory charges (fractions of premium / turnover) used to estimate net P&L.
 # NSE / SEBI revise these; update here if they change.
 CHARGES = {

@@ -119,6 +119,7 @@ Each alert is a macOS notification and is also sent to the phone app:
 * **15-minute direction calls** (9:30 am – 3:15 pm): the chain now vs ~15 min ago (OI added within ±5 strikes of ATM, near-ATM PCR, put / call wall shifts, ATM IV), spot momentum, total PCR, the daily trend, today's level breaks and, on expiry day, max pain. A score of +3 or more is BULLISH, −3 or less BEARISH, otherwise SIDEWAYS, with a strike idea (beyond the OI wall and ~0.8σ). Every call is stored and graded at the next one, so the hit rate shows on the screen. Sound only when the direction changes.
 * **Global markets** (around the clock, every 5 min): a move past an instrument's threshold (e.g. S&P 500 futures 0.8%, Nikkei 1.5%, Brent 3%, USD/INR 0.5%, US 10Y 10 bps), again at 2× and 3×, and a broad-move alert when 4+ markets move ≥1% the same way. At 8:30–9:15 am on weekdays, a "before the open" summary.
 * Also: RED writer-risk alerts, the evening FII/DII setup, BANKNIFTY breadth, EXIT checks on positions and HIGH-impact news.
+* **Your book and account** (Writer risk monitor → *4. Your book*, refreshed with every risk check): net delta in lots, theta per day, vega per IV point, a stress table (index −4 % … +4 % now, with IV unchanged / +3 / −2), breakevens, max profit / loss, P&L at ±1σ and the chance of profit at expiry under implied volatility. Alerts: net delta past `BOOK_DELTA_LOTS` (3 lots), a 4 % move losing more than `MOVE_LOSS_LIMIT_PCT` (3 %) of capital, a short strike at or in the money, a credit book that now pays time decay, chance of profit under 35 %, today's loss past 70 % / 100 % of `DAILY_LOSS_LIMIT_PCT` (2 %), and margin use over `MAX_MARGIN_USE_PCT` (60 %). Set any of these in `.env`.
 
 ### Where Shoonya is used
 Shoonya is used **in market hours only** (weekdays 9:00 am – 3:40 pm IST, pre-open included). Today's saved session connects by itself when the window opens; after 3:40 pm the closing candles and chains are stored and the connection is closed. Outside the window, and whenever Shoonya stops streaming (no index tick for 30 s), every screen uses NSE / Yahoo and the data stored in MongoDB. You can still connect by hand after hours (for example to pull positions); the app asks first.
@@ -155,6 +156,7 @@ Everything is stored in MongoDB as it arrives, so the screens keep working witho
 | `banknifty_service.py` / `banknifty_view.py` | BANKNIFTY constituents: list, weight fit, live picture, alerts / screen |
 | `api_server.py` | Read-only JSON API for the Android companion app (token-protected) |
 | `news_service.py` / `news_view.py` | Market news: fetch, filter, rate, dedupe, alert / screen |
+| `book_risk.py` | Position book: Greeks, stress test, expiry odds, account limits |
 | `market_watch.py` / `watch_service.py` / `watch_view.py` | Global markets, level breaks and 15-minute direction calls: engines / state + MongoDB / the two screens |
 | `menubar.py` | Live index ticker in the macOS menu bar (PyObjC NSStatusItem; Qt tray fallback) |
 | `packaging/` | macOS app build: PyInstaller spec, `build_mac.sh` (.app + .dmg), icon |
