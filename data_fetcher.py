@@ -446,7 +446,8 @@ class MemoryStore:
                              "pnl_daily": ("date",), "trade_journal": ("strategy_id",),
                              "ai_reviews": ("review_id",),
                              "option_chain_snapshots": ("underlying", "expiry", "ts"), "sync_log": ("job",),
-                             "broker_positions": ("date",)}
+                             "broker_positions": ("date",),
+                             "index_constituents": ("index",), "index_weights": ("index",)}
         self._docs: dict[str, dict[tuple, dict]] = {n: {} for n in self.journal_keys}
         self._ohlcv: dict[tuple[str, str], pd.DataFrame] = {}
         self._fii = pd.DataFrame()

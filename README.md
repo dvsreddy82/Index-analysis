@@ -60,11 +60,12 @@ plus the ETFs that track them.
 ## 1. Architecture
 
 ### Screens
-A left navigation rail groups the nine screens. **Ctrl+1 … Ctrl+9** jumps straight to each one.
+A left navigation rail groups the ten screens. **Ctrl+1 … Ctrl+9** jumps straight to the first nine.
 
 | Group | Screen | What it is for |
 |---|---|---|
 | Markets | **Live overview** | Every index and ETF on one screen: live price, change, key levels, EOD signal |
+| Markets | **BANKNIFTY monitor** | BANKNIFTY and its 14 banks: weights, live prices, points each bank adds, heatmap, breadth, VWAP, relative volume, alerts |
 | Markets | **Intraday chart** | NIFTY 50 / BANKNIFTY TradingView-style candles, indicators, levels, drawings, alerts |
 | Markets | **Option chain** | NIFTY / BANKNIFTY chain, OI and IV charts, option-selling analysis |
 | Markets | **Writer risk monitor** | Squeeze / put-flush / divergence / negative-gamma alerts with prohibitions, safe zones and guidance for your legs |
@@ -135,6 +136,7 @@ Everything is stored in MongoDB as it arrives, so the screens keep working witho
 | `sync_service.py` | Background scheduler and `sync_log` |
 | `fii_analysis.py` / `fii_view.py` | FII/DII positioning engine / screen |
 | `risk_engine.py` / `risk_view.py` | Writer risk monitor: threat detectors, GEX, safe zones, leg guidance / screen |
+| `banknifty_service.py` / `banknifty_view.py` | BANKNIFTY constituents: list, weight fit, live picture, alerts / screen |
 | `menubar.py` | Live index ticker in the macOS menu bar (PyObjC NSStatusItem; Qt tray fallback) |
 | `packaging/` | macOS app build: PyInstaller spec, `build_mac.sh` (.app + .dmg), icon |
 | `config.py` | All tunables (Mongo URI, symbols, thresholds); each can be overridden by an environment variable |
@@ -419,6 +421,23 @@ What you get once connected:
 * **Websocket:** `wss://api.shoonya.com/NorenWSAPI/`.
 
 **No orders:** the client is read-only. It never calls an order route.
+
+### BANKNIFTY monitor (the index and all its banks on one screen)
+* **Constituents:** NSE's official list (`ind_niftybanklist.csv`, 14 banks today), refreshed weekly and stored for offline use.
+* **Weights:** NSE no longer publishes live weights, so the app estimates them. BANKNIFTY's return is the weighted sum of its banks' returns, so a non-negative least-squares fit on the last ~6 sessions of 1-minute returns recovers the weights: R² ≈ 0.97, and each day's index move is rebuilt to within ~0.02%. They are re-fitted daily, and **Re-fit weights** forces it.
+* **Prices:** Shoonya ticks for every bank (LTP, previous close, high/low, VWAP, volume), updated every second. Without Shoonya, stored or Yahoo 1-minute candles, refreshed every minute.
+* **What it shows:**
+  * the index with O/H/L, its place in the day's range, and breadth (banks up/down and **% of weight up**);
+  * the top three lifters and draggers;
+  * a **heatmap** sized by weight and coloured by move;
+  * **points each bank added or took away** (weight × % change × previous close);
+  * a table: weight, LTP, change, points to index, day-range position, price vs VWAP, **relative volume** (vs the last 5 sessions at the same time), volume and a sparkline.
+* **Alerts:**
+  * any bank moving ±2% (with its points on the index);
+  * the two heavyweights moving against the index;
+  * narrow rallies or falls (the index up while under half the weight is up);
+  * most heavyweights on the wrong side of VWAP;
+  * relative volume of 2× or more.
 
 ### Writer risk monitor (protection for option writers)
 For NIFTY and BANKNIFTY side by side, in a fixed three-part format:

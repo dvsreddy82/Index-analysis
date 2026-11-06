@@ -55,6 +55,8 @@ from options_service import OptionsService
 from options_view import OptionsDashboard
 from rt_chart import SYMBOLS as RT_SYMBOLS, RealtimeCharts
 from risk_view import RiskDashboard
+from banknifty_service import BankNiftyService
+from banknifty_view import BankNiftyDashboard
 import risk_engine
 import trades_engine as te
 from menubar import MenuBarTicker
@@ -252,7 +254,8 @@ class MainWindow(QMainWindow):
     """Shell: app bar, navigation rail and pages. Data work lives in the services
     (broker, market data, options, trades, sync); this class wires them to screens."""
 
-    NAV = [("MARKETS", [("live", "◉  Live overview"), ("intraday", "◔  Intraday chart"),
+    NAV = [("MARKETS", [("live", "◉  Live overview"), ("banknifty", "▤  BANKNIFTY monitor"),
+                        ("intraday", "◔  Intraday chart"),
                         ("chain", "▦  Option chain"), ("risk", "⚠  Writer risk monitor"),
                         ("fii", "⇅  FII / DII flows")]),
            ("RESEARCH", [("analysis", "◇  Index analysis"), ("scanner", "☰  Scanner")]),
@@ -274,6 +277,8 @@ class MainWindow(QMainWindow):
         self.options = OptionsService(self.svc, self.broker, self.market)
         self.trades_svc = TradesService(self.svc, self.broker, self.options)
         self.sync_svc = SyncService(self.svc, self.broker, self.market, self.runner, self)
+        self.bnf_svc = BankNiftyService(self.svc, self.broker, self.market)
+        self._bnf_at = 0.0
         self.result: dict | None = None
         self.fii = pd.DataFrame()
         self._chart_seq = 0
@@ -421,6 +426,12 @@ class MainWindow(QMainWindow):
         self.live.interval_changed.connect(lambda s: self.live_timer.setInterval(s * 1000))
         self._add("live", "Live overview", "Every index and ETF on one screen: live price, today's move, key levels "
                   "and the EOD signal · real-time from Shoonya where it streams, NSE (≈15 s) for the rest", self.live)
+        self.bnf_view = BankNiftyDashboard()
+        self.bnf_view.refresh_requested.connect(lambda: self.load_banknifty(force=True))
+        self.bnf_view.refit_requested.connect(lambda: self.load_banknifty(force=True, refit=True))
+        self._add("banknifty", "BANKNIFTY monitor", "BANKNIFTY and all its constituent banks in one place: weights, "
+                  "live prices, points each bank adds or takes away, breadth, VWAP, relative volume and alerts",
+                  self.bnf_view)
         self.rtc = RealtimeCharts()
         self.rtc.reload_requested.connect(lambda: self.load_rt_chart(force=True))
         self.rtc.alert_fired.connect(self._chart_alert)
@@ -503,6 +514,8 @@ class MainWindow(QMainWindow):
             self.split.setSizes([side, max(w - side - panel, 300), panel])
         elif key == "live":
             self.poll_live()
+        elif key == "banknifty":
+            self.load_banknifty()
         elif key == "intraday":
             self.load_rt_chart()
             self._chains_due()
@@ -527,6 +540,10 @@ class MainWindow(QMainWindow):
             f"</span> <span style='color:{C['faint']}'>{t:%a %d %b · %H:%M:%S} IST</span>")
         if self.current_page() == "intraday":
             self.load_rt_chart()                   # no-op until the reload interval has passed
+        if self.current_page() == "banknifty":
+            self.load_banknifty()                  # candles / weights: every 2 min (1 min without Shoonya)
+            if self.bnf_svc.symbols and self.broker.live:
+                self.bnf_view.set_snapshot(self.bnf_svc.live_snapshot())
         if self.broker.live:
             if self._last_snap and self.current_page() == "live":
                 self._show_snapshot()
@@ -832,6 +849,35 @@ class MainWindow(QMainWindow):
                 log.warning("Background chain failed: %s", e.splitlines()[0])
 
             self.runner.start(lambda _p, u=und: self.options.analyse(u, None), done, failed)
+
+    # ================================================================== BANKNIFTY monitor
+    def load_banknifty(self, force: bool = False, refit: bool = False):
+        every = 120 if self.broker.live else 60
+        if self._flags.get("bnf") or (not force and time.time() - self._bnf_at < every):
+            return
+        self._flags["bnf"] = True
+        self._bnf_at = time.time()
+        bnf = self.bnf_svc
+        self.bnf_view.set_status("Refreshing candles…" if bnf.symbols else "Loading BANKNIFTY constituents…")
+
+        def done(out):
+            self._flags["bnf"] = False
+            fit = out["fit"]
+            src = {"shoonya": "Shoonya real-time ticks", "yahoo": "Yahoo 1-min (delayed)",
+                   "offline": "stored candles (offline)"}
+            srcs = " + ".join(sorted(src.get(x, x) for x in out["sources"]))
+            fit_txt = (f"weights fitted {fit['at']} on {fit['bars']:,} one-minute bars, R² {fit['r2']:.3f}"
+                       if fit.get("r2") is not None else fit.get("note", ""))
+            self.bnf_view.set_status(f"{len(bnf.symbols)} banks · {srcs} · {fit_txt} · candles updated "
+                                     f"{datetime.now():%H:%M:%S}")
+            self.bnf_view.set_snapshot(bnf.live_snapshot())
+
+        def failed(err):
+            self._flags["bnf"] = False
+            self.bnf_view.set_status(f"<span style='color:{C['down']}'>BANKNIFTY refresh failed: "
+                                     f"{html.escape(err.splitlines()[0])}</span>")
+
+        self.runner.start(lambda _p: bnf.refresh(refit=refit), done, failed)
 
     # ================================================================== writer risk monitor
     def load_risk(self, force: bool = False):

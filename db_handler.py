@@ -135,7 +135,8 @@ class DBHandler:
         self.journal_keys = {"broker_fills": ("fill_id",), "broker_orders": ("order_no", "date"),
                              "pnl_daily": ("date",), "trade_journal": ("strategy_id",), "ai_reviews": ("review_id",),
                              "option_chain_snapshots": ("underlying", "expiry", "ts"), "sync_log": ("job",),
-                             "broker_positions": ("date",)}
+                             "broker_positions": ("date",),
+                             "index_constituents": ("index",), "index_weights": ("index",)}
         self.ensure_schema()
 
     # ------------------------------------------------------------ setup
