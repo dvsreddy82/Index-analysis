@@ -270,7 +270,7 @@ class BankNiftyService:
             if q["pct"] is not None and abs(q["pct"]) >= BIG_MOVE:
                 out.append(("amber", f"{q['symbol']} {q['pct']:+.2f}% — "
                                      f"{q['contrib']:+.0f} pts on BANKNIFTY (weight {q['weight'] * 100:.1f}%)"))
-        if ipct is not None:
+        if ipct is not None and abs(ipct) >= 0.2:            # the index must actually be moving
             heavy = [q for q in sorted(rows, key=lambda q: -q["weight"])[:2] if q["pct"] is not None]
             against = [q for q in heavy if (q["pct"] > 0) != (ipct > 0) and abs(q["pct"]) >= 0.3]
             if against:

@@ -81,6 +81,10 @@ A left navigation rail groups the ten screens. **Ctrl+1 … Ctrl+9** jumps strai
 * From the same menu you can choose BANKNIFTY, NIFTY or both, hide the price, or open the app.
 * It needs `pyobjc-framework-Cocoa` (in requirements, macOS only). Elsewhere it falls back to a tray icon with the text in its tooltip.
 
+**Android companion app:** the separate project `../NSE-Quant-Terminal-Android` reads this app's data on your phone. It has a live BANKNIFTY notification and alerts, plus the Home, BANKNIFTY, Chain, Risk and FII/DII screens.
+* **How it connects:** the desktop app serves a small **read-only, key-protected JSON API** (`api_server.py`, port `PHONE_API_PORT`, default 8787). The phone never talks to Shoonya, so your single Shoonya session stays on the Mac.
+* **To pair:** **Sync ▾ → Connect phone (Android app)…** shows the address and key. The key is stored in `~/.nse_analytics/api.json`.
+
 Each screen starts the same way: a title, a one-line purpose, then a toolbar for that screen's own controls. One **app bar** at the top is shared by all of them:
 * market open/closed and the IST clock;
 * the data source (real-time or NSE delayed);
@@ -137,6 +141,7 @@ Everything is stored in MongoDB as it arrives, so the screens keep working witho
 | `fii_analysis.py` / `fii_view.py` | FII/DII positioning engine / screen |
 | `risk_engine.py` / `risk_view.py` | Writer risk monitor: threat detectors, GEX, safe zones, leg guidance / screen |
 | `banknifty_service.py` / `banknifty_view.py` | BANKNIFTY constituents: list, weight fit, live picture, alerts / screen |
+| `api_server.py` | Read-only JSON API for the Android companion app (token-protected) |
 | `menubar.py` | Live index ticker in the macOS menu bar (PyObjC NSStatusItem; Qt tray fallback) |
 | `packaging/` | macOS app build: PyInstaller spec, `build_mac.sh` (.app + .dmg), icon |
 | `config.py` | All tunables (Mongo URI, symbols, thresholds); each can be overridden by an environment variable |

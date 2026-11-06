@@ -178,6 +178,8 @@ TIMEFRAMES: dict[str, tuple[str, str]] = {
     "15m": ("15m", "60d"),
 }
 
+PHONE_API_PORT: int = _env("PHONE_API_PORT", 8787)   # read-only API for the Android companion app
+
 # Timeframes kept in index_ohlcv: the analysis timeframes plus 1-minute bars for the intraday chart.
 STORED_TIMEFRAMES: list[str] = list(TIMEFRAMES) + ["1m"]
 

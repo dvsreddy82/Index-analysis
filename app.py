@@ -60,6 +60,7 @@ from banknifty_service import BankNiftyService
 from banknifty_view import BankNiftyDashboard
 import risk_engine
 import trades_engine as te
+from api_server import ApiServer
 from menubar import MenuBarTicker
 from shoonya_feed import INDEX_TOKENS, VIX_TOKEN
 from sync_service import SyncService, market_open, now_ist
@@ -348,6 +349,9 @@ class MainWindow(QMainWindow):
         self.run_analysis()
         self.compute_levels()
         self.load_fii()
+        self.api = ApiServer(self)                 # read-only API for the Android companion app
+        self.api.need.connect(self._api_need)
+        self.api.start()
         self.broker.auto_connect()                 # today's saved Shoonya session, silently
         self.sync_svc.start()
 
@@ -380,6 +384,8 @@ class MainWindow(QMainWindow):
         menu.addAction("Back-fill intraday candles from Shoonya", lambda: self.sync_svc.run_intraday(full=True))
         menu.addSeparator()
         menu.addAction("Import FII/DII history (CSV)…", self.import_csv)
+        menu.addSeparator()
+        menu.addAction("Connect phone (Android app)…", self.show_phone_pairing)
         self.sync_btn.setMenu(menu)
         h.addWidget(self.sync_btn)
         self.broker_btn = QPushButton("Connect Shoonya")
@@ -580,6 +586,7 @@ class MainWindow(QMainWindow):
         extra["setup"] = getattr(self, "_setup_active", None)
         extra["red"] = sum(1 for r in res for a in r["alerts"] if a["level"] == "RED")
         extra["amber"] = sum(1 for r in res for a in r["alerts"] if a["level"] == "AMBER")
+        self._ticker_state = (quotes, extra)          # also served to the phone app (/api/ticker)
         self.ticker.update(quotes, extra)
 
     def _bring_to_front(self):
@@ -643,7 +650,54 @@ class MainWindow(QMainWindow):
         self.opt_timer.setInterval(config.OPTIONS_REFRESH_SECONDS * 1000)
         self._status("Shoonya disconnected — using NSE delayed data and stored history")
 
+    def _api_need(self, what: str):
+        """A phone request found stale data: refresh it on the GUI thread."""
+        if what == "banknifty":
+            self.load_banknifty()
+        elif what == "risk":
+            self.load_risk(force=True)
+        elif what == "trades":
+            self.sync_trades(pull=self.broker.live)
+
+    def show_phone_pairing(self):
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLineEdit
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Connect the Android app")
+        dlg.setMinimumWidth(560)
+        v = QVBoxLayout(dlg)
+        if self.api.error:
+            v.addWidget(wrap_label(f"<span style='color:{C['down']}'>The phone API is not running: "
+                                   f"{html.escape(self.api.error)}</span>"))
+        v.addWidget(wrap_label("In the app on your phone, open <b>Settings</b> and enter one of these server addresses "
+                               "and the key. Phone and Mac must be on the same Wi-Fi — or both on "
+                               "<b>Tailscale</b> (use the 100.x address) to connect from anywhere."))
+        for u in self.api.urls() or ["(no network address found)"]:
+            row = QHBoxLayout()
+            e = QLineEdit(u)
+            e.setReadOnly(True)
+            row.addWidget(e, 1)
+            b = QPushButton("Copy")
+            b.clicked.connect(lambda _=False, t=u: QApplication.clipboard().setText(t))
+            row.addWidget(b)
+            v.addLayout(row)
+        row = QHBoxLayout()
+        k = QLineEdit(self.api.key)
+        k.setReadOnly(True)
+        row.addWidget(k, 1)
+        b = QPushButton("Copy key")
+        b.clicked.connect(lambda: QApplication.clipboard().setText(self.api.key))
+        row.addWidget(b)
+        v.addLayout(row)
+        v.addWidget(wrap_label(f"<span style='color:{C['muted']}'>Read-only: the phone can view data, never place "
+                               "orders. If macOS asks whether to allow incoming connections, click Allow. Keep the "
+                               "key private — anyone on your network with it can read your positions.</span>"))
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+        dlg.exec()
+
     def closeEvent(self, event):
+        self.api.stop()
         self.ticker.close()
         self.broker.feed.close()
         super().closeEvent(event)
