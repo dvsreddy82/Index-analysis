@@ -248,6 +248,9 @@ class BankNiftyService:
             q["range_pos"] = ((q["last"] - q["low"]) / (q["high"] - q["low"]) * 100
                               if q.get("high") and q.get("low") and q["high"] > q["low"] and q["last"] else None)
             rows.append(q)
+        idx["spark"] = self.sparks.get("__INDEX__") or []      # today's index line (every 2nd minute)
+        if idx.get("live") and idx.get("last") and idx["spark"]:
+            idx["spark"] = idx["spark"] + [idx["last"]]            # end on the live tick
         base = idx["prev"] or idx["last"]
         for q in rows:
             q["contrib"] = q["weight"] * q["pct"] / 100 * base if q["pct"] is not None and base else None
