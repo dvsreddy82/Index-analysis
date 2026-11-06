@@ -58,6 +58,8 @@ from rt_chart import SYMBOLS as RT_SYMBOLS, RealtimeCharts
 from risk_view import RiskDashboard
 from banknifty_service import BankNiftyService
 from banknifty_view import BankNiftyDashboard
+from news_service import NewsService, market_window as news_market_window
+from news_view import NewsDashboard
 import risk_engine
 import trades_engine as te
 from api_server import ApiServer
@@ -259,7 +261,7 @@ class MainWindow(QMainWindow):
     NAV = [("MARKETS", [("live", "◉  Live overview"), ("banknifty", "▤  BANKNIFTY monitor"),
                         ("intraday", "◔  Intraday chart"),
                         ("chain", "▦  Option chain"), ("risk", "⚠  Writer risk monitor"),
-                        ("fii", "⇅  FII / DII flows")]),
+                        ("fii", "⇅  FII / DII flows"), ("news", "✉  Market news")]),
            ("RESEARCH", [("analysis", "◇  Index analysis"), ("scanner", "☰  Scanner")]),
            ("MY TRADING", [("trades", "₹  Trades & P&L"), ("ai", "✦  AI coach")])]
 
@@ -280,6 +282,8 @@ class MainWindow(QMainWindow):
         self.trades_svc = TradesService(self.svc, self.broker, self.options)
         self.sync_svc = SyncService(self.svc, self.broker, self.market, self.runner, self)
         self.bnf_svc = BankNiftyService(self.svc, self.broker, self.market)
+        self.news_svc = NewsService(self.svc)
+        self._news_at = 0.0
         self._bnf_at = 0.0
         self.result: dict | None = None
         self.fii = pd.DataFrame()
@@ -341,6 +345,11 @@ class MainWindow(QMainWindow):
         self.risk_timer.setInterval(15_000)
         self.risk_timer.timeout.connect(self.load_risk)
         self.risk_timer.start()
+        self.news_timer = QTimer(self)             # every 2 min around market hours, 10 min otherwise
+        self.news_timer.setInterval(30_000)
+        self.news_timer.timeout.connect(self.load_news)
+        self.news_timer.start()
+        QTimer.singleShot(8_000, lambda: self.load_news(force=True))
 
         self.ticker = MenuBarTicker(on_open=self._bring_to_front)   # live index price in the menu bar
         self._broker_state()
@@ -459,6 +468,10 @@ class MainWindow(QMainWindow):
         self.fii_view.zones_requested.connect(lambda: self._chains_due(force=True))
         self._add("fii", "FII / DII flows", "Institutional cash flows and F&O positioning → a direction for option "
                   "writing · synced automatically as NSE publishes (≈5–9 pm IST)", self.fii_view)
+        self.news_view = NewsDashboard()
+        self.news_view.refresh_requested.connect(lambda: self.load_news(force=True))
+        self._add("news", "Market news", "Headlines that can move NIFTY and BANKNIFTY — RBI, NSE bank filings and "
+                  "market news, rated by impact · HIGH items alert you on the Mac and the phone", self.news_view)
         # Research
         analysis = QWidget(objectName="root")
         al = QHBoxLayout(analysis)
@@ -934,6 +947,47 @@ class MainWindow(QMainWindow):
                                      f"{html.escape(err.splitlines()[0])}</span>")
 
         self.runner.start(lambda _p: bnf.refresh(refit=refit), done, failed)
+
+    # ================================================================== market news
+    def load_news(self, force: bool = False):
+        every = 120 if news_market_window() else 600
+        if self._flags.get("news") or (not force and time.time() - self._news_at < every):
+            return
+        self._flags["news"] = True
+        self._news_at = time.time()
+        news = self.news_svc
+
+        def job(_p):
+            new = news.poll()
+            alerts = news.select_alerts(new)
+            if alerts:
+                at = datetime.now().astimezone()
+                news.store.upsert_docs("news", [{"id": d["id"], "alerted": True, "alerted_at": at,
+                                                 "related": d.get("related", 0)} for d in alerts])
+            return news.recent(hours=36), alerts, dict(news.status), len(new)
+
+        def done(out):
+            self._flags["news"] = False
+            items, alerts, st, n_new = out
+            self.news_view.set_items(items)
+            fail = f" · <span style='color:{C['warn']}'>unavailable: {', '.join(st['failed'])}</span>" if st["failed"] else ""
+            hi = sum(1 for d in items if d.get("impact") == "HIGH" and (datetime.now().astimezone()
+                     - pd.Timestamp(d["published"]).to_pydatetime()).total_seconds() < 6 * 3600)
+            self.news_view.set_status(f"Checked {datetime.now():%H:%M:%S} · {st['ok']}/{st['total']} sources · "
+                                      f"{n_new} new · {len(items)} relevant headlines in 36 h · {hi} high-impact in the "
+                                      f"last 6 h{fail}")
+            for d in alerts:
+                extra = f" (+{d['related']} related headlines)" if d.get("related") else ""
+                tags = "/".join(t for t in d.get("tags", []) if t in ("BANKNIFTY", "NIFTY", "RBI", "MACRO"))
+                self._status(f"📰 {tags}: {d['title']}{extra}")
+                notify(f"📰 Market news · {tags or 'HIGH impact'}", d["title"] + extra, sound=True)
+
+        def failed(err):
+            self._flags["news"] = False
+            self.news_view.set_status(f"<span style='color:{C['down']}'>News check failed: "
+                                      f"{html.escape(err.splitlines()[0])}</span>")
+
+        self.runner.start(job, done, failed)
 
     # ================================================================== writer risk monitor
     def load_risk(self, force: bool = False):
@@ -1616,14 +1670,15 @@ class MainWindow(QMainWindow):
             self.table.setItem(i, j, it)
 
 
-def notify(title: str, text: str):
+def notify(title: str, text: str, sound: bool = False):
     """macOS notification-centre banner (best effort, non-blocking)."""
     if sys.platform != "darwin":
         return
     import subprocess
     esc = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')
     try:
-        subprocess.Popen(["osascript", "-e", f'display notification "{esc(text)}" with title "{esc(title)}"'],
+        snd = ' sound name "Glass"' if sound else ""
+        subprocess.Popen(["osascript", "-e", f'display notification "{esc(text)}" with title "{esc(title)}"{snd}'],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         pass

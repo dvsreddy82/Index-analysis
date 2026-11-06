@@ -70,6 +70,7 @@ A left navigation rail groups the ten screens. **Ctrl+1 … Ctrl+9** jumps strai
 | Markets | **Option chain** | NIFTY / BANKNIFTY chain, OI and IV charts, option-selling analysis |
 | Markets | **Writer risk monitor** | Squeeze / put-flush / divergence / negative-gamma alerts with prohibitions, safe zones and guidance for your legs |
 | Markets | **FII / DII flows** | Institutional positioning → option-writing direction and strike zones |
+| Markets | **Market news** | Headlines that can move NIFTY / BANKNIFTY (RBI, NSE bank filings, market news), rated by impact, with alerts |
 | Research | **Index analysis** | Zones, pivots, volume profile and decision card for any index or ETF |
 | Research | **Scanner** | Daily analysis of all 56 instruments in one table |
 | My trading | **Trades & P&L** | Positions, orders, fills, history, performance, "why I lost", journal |
@@ -142,6 +143,7 @@ Everything is stored in MongoDB as it arrives, so the screens keep working witho
 | `risk_engine.py` / `risk_view.py` | Writer risk monitor: threat detectors, GEX, safe zones, leg guidance / screen |
 | `banknifty_service.py` / `banknifty_view.py` | BANKNIFTY constituents: list, weight fit, live picture, alerts / screen |
 | `api_server.py` | Read-only JSON API for the Android companion app (token-protected) |
+| `news_service.py` / `news_view.py` | Market news: fetch, filter, rate, dedupe, alert / screen |
 | `menubar.py` | Live index ticker in the macOS menu bar (PyObjC NSStatusItem; Qt tray fallback) |
 | `packaging/` | macOS app build: PyInstaller spec, `build_mac.sh` (.app + .dmg), icon |
 | `config.py` | All tunables (Mongo URI, symbols, thresholds); each can be overridden by an environment variable |
@@ -443,6 +445,25 @@ What you get once connected:
   * narrow rallies or falls (the index up while under half the weight is up);
   * most heavyweights on the wrong side of VWAP;
   * relative volume of 2× or more.
+
+### Market news (with alerts)
+**Sources (public RSS):**
+* RBI press releases and notifications;
+* NSE corporate announcements, filtered to the 14 BANKNIFTY banks by exact company name;
+* Economic Times Markets and Stocks, Livemint Markets, Business Standard Markets;
+* two Google News searches (Nifty / Bank Nifty / Sensex, and RBI plus the five biggest banks), each naming the original publisher.
+
+They're checked every 2 minutes from 8:30 am to 4 pm IST on weekdays, and every 10 minutes otherwise.
+
+**What's kept:** only headlines about NIFTY, BANKNIFTY, a constituent bank, the RBI or a macro driver (rates, inflation, crude, rupee, FII flows, Fed, global sell-offs, SEBI F&O rules). Each one is:
+* **tagged** BANKNIFTY / NIFTY / MACRO / RBI / FILING;
+* **rated by impact.** HIGH means RBI policy, inflation / GDP / budget data, Fed decisions, SEBI F&O changes, index crashes or record highs, war, India rating changes, big crude moves, record FII flows, results from or RBI action against the five heavyweight banks. Routine RBI operations and filings are LOW;
+* given a **headline tone** (▲ / ▼ / •). It's a keyword reading aid, not a forecast;
+* **merged** with the same story from other outlets.
+
+Recruitment notices, product offers and price-ticker pages are dropped. Everything is stored in MongoDB (`news`).
+
+**Alerts:** a HIGH headline published within the last hour raises a Mac notification (with sound) and appears in the phone's alerts feed. To avoid storms, you get one alert per story (synonyms such as sell-off / rout / crash / bloodbath count as one theme) and at most one every 20 minutes. Each alert says how many related headlines arrived since the last one; all of them stay on the screen. Replaying 6 Nov 2026, the 27 HIGH headlines in 17 hours produced 5 alerts. Double-click a headline to open it.
 
 ### Writer risk monitor (protection for option writers)
 For NIFTY and BANKNIFTY side by side, in a fixed three-part format:

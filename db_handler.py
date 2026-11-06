@@ -136,7 +136,8 @@ class DBHandler:
                              "pnl_daily": ("date",), "trade_journal": ("strategy_id",), "ai_reviews": ("review_id",),
                              "option_chain_snapshots": ("underlying", "expiry", "ts"), "sync_log": ("job",),
                              "broker_positions": ("date",),
-                             "index_constituents": ("index",), "index_weights": ("index",)}
+                             "index_constituents": ("index",), "index_weights": ("index",),
+                             "news": ("id",)}
         self.ensure_schema()
 
     # ------------------------------------------------------------ setup
@@ -168,6 +169,7 @@ class DBHandler:
         for name, keys in self.journal_keys.items():
             self.db[name].create_index([(k, ASCENDING) for k in keys], unique=True, name="_".join(keys) + "_unique")
         self.db["broker_fills"].create_index([("time", DESCENDING)], name="time")
+        self.db["news"].create_index([("published", DESCENDING)], name="published")
         self.db["option_chain_snapshots"].create_index([("underlying", ASCENDING), ("ts", DESCENDING)],
                                                        name="underlying_ts")
 

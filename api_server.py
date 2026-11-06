@@ -18,6 +18,7 @@ Endpoints (all GET, JSON):
   /api/risk        writer risk monitor for both indices
   /api/fii         FII/DII read, evening setup, strike zones, signals, recent sessions
   /api/positions   open positions with management alerts, today's P&L, margin
+  /api/news        relevant headlines (?hours=&impact=HIGH&tag=BANKNIFTY&limit=)
   /api/alerts      every active alert with a stable id (the phone notifies on new ids)
 """
 from __future__ import annotations
@@ -157,7 +158,8 @@ class ApiServer(QObject):
             return self._send(h, 401, {"error": "missing or wrong API key"})
         route = {"/api/health": self.health, "/api/ticker": self.ticker, "/api/overview": self.overview,
                  "/api/banknifty": self.banknifty, "/api/chain": self.chain, "/api/risk": self.risk,
-                 "/api/fii": self.fii, "/api/positions": self.positions, "/api/alerts": self.alerts}.get(url.path)
+                 "/api/fii": self.fii, "/api/positions": self.positions, "/api/alerts": self.alerts,
+                 "/api/news": self.news}.get(url.path)
         if route is None:
             return self._send(h, 404, {"error": "unknown endpoint"})
         try:
@@ -309,6 +311,14 @@ class ApiServer(QObject):
                 "synced_at": at, "metrics": {k: v for k, v in (d.get("metrics") or {}).items()
                                              if k not in ("best", "worst")}}
 
+    def news(self, q):
+        hours = min(int(q.get("hours") or 24), 72)
+        items = self.win.news_svc.recent(hours=hours, impact=q.get("impact") or None, tag=q.get("tag") or None,
+                                         limit=int(q.get("limit") or 60))
+        keep = ("id", "title", "summary", "link", "source", "sources", "published", "impact", "tags", "banks", "tone",
+                "alerted", "related")
+        return {"items": [{k: d.get(k) for k in keep} for d in items], "status": self.win.news_svc.status}
+
     def alerts(self, _q):
         """Every active alert with a stable id; the phone raises a notification for unseen ids."""
         items = []
@@ -333,6 +343,13 @@ class ApiServer(QObject):
                 if a == "stop":
                     items.append({"id": _id("pos", g["und"], g["expiry"], t[:50]), "level": "RED",
                                   "source": "My positions", "title": f"EXIT · {g['und']} {g['structure']}", "text": t})
+        for d in self.win.news_svc.recent(hours=6, impact="HIGH", limit=40):
+            if d.get("alerted"):
+                extra = f" (+{d['related']} related)" if d.get("related") else ""
+                items.append({"id": _id("news", d["id"]), "level": "NEWS", "source": d.get("source", "News"),
+                              "title": "Market news · " + "/".join(t for t in d.get("tags", [])
+                                                                   if t in ("BANKNIFTY", "NIFTY", "RBI", "MACRO")),
+                              "text": d["title"] + extra, "link": d.get("link")})
         return {"alerts": items, "time": datetime.now()}
 
 
