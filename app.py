@@ -496,7 +496,7 @@ class MainWindow(QMainWindow):
                   self.signals_view)
         self.global_view = GlobalDashboard()
         self.global_view.refresh_requested.connect(lambda: self.load_global(force=True))
-        self._add("global", "Global markets", "US, Asian and European indices, US futures, crude, dollar, yields, rupee "
+        self._add("global", "Global markets", "GIFT Nifty, US, Asian and European indices, US futures, crude, dollar, yields, rupee "
                   "and US VIX — what can move India's open · alerts on major moves", self.global_view)
         self.news_view = NewsDashboard()
         self.news_view.refresh_requested.connect(lambda: self.load_news(force=True))

@@ -106,11 +106,11 @@ class GlobalDashboard(QWidget):
             hh.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
         hh.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         lay.addWidget(self.table, 1)
-        lay.addWidget(label(f"<span style='color:{C['muted']}'>Yahoo Finance quotes, checked every 5 min around the "
+        lay.addWidget(label(f"<span style='color:{C['muted']}'>GIFT Nifty from sgxnifty.org, the rest from Yahoo Finance, checked every 5 min around the "
                             "clock. Change is against each market's previous close (US 10Y in basis points). An alert "
                             "fires when a move passes the threshold shown in the tooltip, again at 2× and 3×, and once "
-                            "for a broad move (4+ markets ≥1% the same way). The open read weights US futures, Asia, "
-                            "the rupee, the dollar, crude and yields — context for the session, not a forecast."
+                            "for a broad move (4+ markets ≥1% the same way). The open read weights GIFT Nifty most "
+                            "(its gap vs NIFTY's close includes the futures premium), then US futures, Asia, the rupee, the dollar, crude and yields — context for the session, not a forecast."
                             "</span>", 11))
 
     def set_status(self, text: str):
