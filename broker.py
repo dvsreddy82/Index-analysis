@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import html
 import logging
-from datetime import date, time as dtime
+from datetime import date
 
 from PySide6.QtCore import QObject, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
@@ -27,18 +27,12 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBo
 
 from shoonya_feed import (REDIRECT_URL, OAuthCatcher, ShoonyaFeed, code_from_text, from_env, load_settings,
                           save_settings, totp_now)
-from sync_service import market_open, now_ist
+from market_hours import SESSION, in_session, market_open, now_ist  # noqa: F401
 from tasks import Runner
 from theme import C, label
 
 log = logging.getLogger(__name__)
 
-SESSION = (dtime(9, 0), dtime(15, 40))          # when Shoonya is used (IST, weekdays)
-
-
-def in_session(t=None) -> bool:
-    t = t or now_ist()
-    return t.weekday() < 5 and SESSION[0] <= t.time() <= SESSION[1]
 
 
 class Broker(QObject):

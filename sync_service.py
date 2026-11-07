@@ -30,18 +30,10 @@ from tasks import Runner
 
 log = logging.getLogger(__name__)
 
-IST_OPEN, IST_CLOSE = dtime(9, 15), dtime(15, 30)
+from market_hours import IST_CLOSE, IST_OPEN, market_open, now_ist  # noqa: F401  (re-exported)
+
 FII_WINDOW = (dtime(16, 30), dtime(23, 0))
 EOD_AFTER = dtime(18, 30)
-
-
-def now_ist() -> datetime:
-    return pd.Timestamp.now(tz=config.IST).to_pydatetime()
-
-
-def market_open(t: datetime | None = None) -> bool:
-    t = t or now_ist()
-    return t.weekday() < 5 and IST_OPEN <= t.time() <= IST_CLOSE
 
 
 class SyncService(QObject):

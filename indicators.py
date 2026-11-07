@@ -80,11 +80,15 @@ def pivot_levels(h: float, l: float, c: float) -> dict[str, dict[str, float]]:
     }
 
 
+# month-end alias: "ME" from pandas 2.2 ("M" is deprecated there); the Android build ships pandas 2.1
+MONTH_END = "ME" if tuple(int(x) for x in pd.__version__.split(".")[:2]) >= (2, 2) else "M"
+
+
 def period_pivots(daily: pd.DataFrame, freq: str) -> dict:
     """Pivots for the *current* week ('W') or month ('M'), derived from the last
     completed period. Early in a month this is exactly the projection for the
     upcoming month."""
-    rule = {"W": "W-FRI", "M": "ME"}[freq]
+    rule = {"W": "W-FRI", "M": MONTH_END}[freq]
     agg = daily.resample(rule).agg({"high": "max", "low": "min", "close": "last"}).dropna()
     if agg.empty:
         return {}

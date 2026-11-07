@@ -28,8 +28,16 @@ from datetime import date, datetime, timedelta
 from typing import Callable
 
 import pandas as pd
+import os
+
 import requests
-import yfinance as yf
+
+try:                                    # the standalone Android app has no yfinance: Yahoo's chart API instead
+    if os.getenv("NSE_YAHOO_LITE"):
+        raise ImportError
+    import yfinance as yf
+except ImportError:
+    import yahoo_lite as yf
 
 import config
 
@@ -485,8 +493,11 @@ class MemoryStore:
         return len(keys)
 
     def upsert_ohlcv(self, symbol, timeframe, df):
-        old = self._ohlcv.get((symbol, timeframe), pd.DataFrame())
-        new = pd.concat([old, df])
+        if df is None or df.empty:
+            return 0
+        old = self._ohlcv.get((symbol, timeframe))
+        new = df.copy() if old is None or old.empty else pd.concat([old, df])
+        new.index = pd.DatetimeIndex(new.index)      # concat with an empty frame gives an object index on pandas < 2.2
         self._ohlcv[(symbol, timeframe)] = new[~new.index.duplicated(keep="last")].sort_index()
         return len(df)
 
