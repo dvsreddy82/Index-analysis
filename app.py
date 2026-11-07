@@ -1208,7 +1208,7 @@ class MainWindow(QMainWindow):
             col.set_levels(w.levels.get(und) or [], w.level_status(und), spot)
             calls = w.today_calls(und)
             col.set_history(calls, w.hit_rate(calls))
-        self.signals_view.set_alerts(w.recent_alerts(1, ("LEVEL",)))
+        self.signals_view.set_alerts(w.recent_alerts(1, ("LEVEL", "WRITER")))
 
     # ================================================================== writer risk monitor
     def load_risk(self, force: bool = False):
@@ -1228,6 +1228,7 @@ class MainWindow(QMainWindow):
         opts, svc, trades = self.options, self.svc, self.trades_svc
         td = self.trades.data or {}
         limits, today = dict(td.get("limits") or {}), dict(td.get("today") or {})
+        orders = list(td.get("orders") or [])
         capital = config.TRADING_CAPITAL or float(limits.get("margin_used") or 0) + float(limits.get("available") or 0)
 
         def job(_p):
@@ -1237,7 +1238,7 @@ class MainWindow(QMainWindow):
             if book is None:
                 docs = svc.store.find_docs("broker_positions", sort="date", desc=True, limit=1)
                 book = docs[0].get("rows") if docs else []
-            out = {}
+            out, wctx = {}, {}
             for und, sym in (("NIFTY", "^NSEI"), ("BANKNIFTY", "NIFTY BANK")):
                 try:
                     res = opts.fresh(und, 45) or opts.analyse(und)
@@ -1269,12 +1270,24 @@ class MainWindow(QMainWindow):
                                 books.append(b)
                     out[und]["books"] = books
                     out[und]["alerts"] += [a for b in books for a in book_risk.book_alerts(b, capital)]
+                    wctx[und] = {"res": res, "chains": {res["expiry"]: res, **chains},
+                                 "groups": [g for g in groups if g["und"] == und], "books": books}
                 except Exception as exc:
                     out[und] = {"error": str(exc)}
-            return out
+            try:
+                writer_new = self.watch.check_writer(wctx, self.broker.feed, orders)
+            except Exception as exc:
+                log.warning("writer signals failed: %s", exc)
+                writer_new = []
+            return out, writer_new
 
-        def done(out):
+        def done(result):
             self._flags["risk"] = False
+            out, writer_new = result
+            for a in writer_new:
+                notify(f"✍ {a['title']}", a["text"], sound=a["level"] == "RED")
+            if writer_new:
+                self.signals_view.set_alerts(self.watch.recent_alerts(1, ("LEVEL", "WRITER")))
             books = [b for r in out.values() if "error" not in r for b in r.get("books", [])]
             acc = book_risk.account_check(today, limits, books) if (limits or books) else None
             self._account = acc

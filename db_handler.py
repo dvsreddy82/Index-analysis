@@ -137,7 +137,7 @@ class DBHandler:
                              "option_chain_snapshots": ("underlying", "expiry", "ts"), "sync_log": ("job",),
                              "broker_positions": ("date",),
                              "index_constituents": ("index",), "index_weights": ("index",),
-                             "news": ("id",), "market_alerts": ("id",), "direction_calls": ("und", "slot"),
+                             "news": ("id",), "market_alerts": ("id",), "direction_calls": ("und", "slot"), "writer_state": ("day", "und"),
                              "global_quotes": ("key", "session")}
         self.ensure_schema()
 

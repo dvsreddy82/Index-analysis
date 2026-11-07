@@ -51,7 +51,8 @@ def alert_html(items: list[dict], empty: str) -> str:
         return f"<span style='color:{C['muted']}'>{_esc(empty)}</span>"
     rows = []
     for a in items:
-        col = C["down"] if a.get("level") == "HIGH" else C["warn"]
+        col = (C["down"] if a.get("level") in ("HIGH", "RED") else C["muted"] if a.get("level") == "INFO"
+               else C["warn"])
         rows.append(f"<div style='margin-bottom:6px'><span style='color:{C['faint']}'>{_ist(a.get('raised_at'))}</span> "
                     f"<b style='color:{col}'>{_esc(a['title'])}</b><br><span style='color:{C['muted']}'>"
                     f"{_esc(a['text'])}</span></div>")
@@ -291,7 +292,7 @@ class SignalsDashboard(QWidget):
         for c in self.cols.values():
             row.addWidget(c, 1)
         v.addLayout(row)
-        f, l = card("Level alerts today")
+        f, l = card("Level breaks and writer signals today")
         self.alerts = label()
         l.addWidget(self.alerts)
         v.addWidget(f)
@@ -300,7 +301,10 @@ class SignalsDashboard(QWidget):
                           "5-minute close 0.05% through the level, and alerts once a day per direction. Direction "
                           "calls score the option chain now vs ~15 min ago (OI added near the money, PCR, wall "
                           "shifts, ATM IV), spot momentum, level breaks and the daily trend: ≥ +3 BULLISH, ≤ −3 "
-                          "BEARISH, otherwise SIDEWAYS. Mechanical reads on exchange data — not a forecast or "
+                          "BEARISH, otherwise SIDEWAYS. Writer signals (with each risk check): profit targets, short-leg "
+                          "delta, VIX / ATM IV spikes, expiry-day gamma, expected move, futures buildup, writing "
+                          "conditions, OI wall shifts, PCR / skew, max pain, time-based exits and discipline. "
+                          "Mechanical reads on exchange data — not a forecast or "
                           "investment advice.</span>", 11))
         v.addStretch(1)
         sc.setWidget(inner)
@@ -310,4 +314,4 @@ class SignalsDashboard(QWidget):
         self.status.setText(text)
 
     def set_alerts(self, items: list[dict]):
-        self.alerts.setText(alert_html(items, "No level breaks today."))
+        self.alerts.setText(alert_html(items, "No level breaks or writer signals today."))

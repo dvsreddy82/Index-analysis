@@ -121,6 +121,15 @@ Each alert is a macOS notification and is also sent to the phone app:
 * Also: RED writer-risk alerts, the evening FII/DII setup, BANKNIFTY breadth, EXIT checks on positions and HIGH-impact news.
 * **Your book and account** (Writer risk monitor → *4. Your book*, refreshed with every risk check): net delta in lots, theta per day, vega per IV point, a stress table (index −4 % … +4 % now, with IV unchanged / +3 / −2), breakevens, max profit / loss, P&L at ±1σ and the chance of profit at expiry under implied volatility. Alerts: net delta past `BOOK_DELTA_LOTS` (3 lots), a 4 % move losing more than `MOVE_LOSS_LIMIT_PCT` (3 %) of capital, a short strike at or in the money, a credit book that now pays time decay, chance of profit under 35 %, today's loss past 70 % / 100 % of `DAILY_LOSS_LIMIT_PCT` (2 %), and margin use over `MAX_MARGIN_USE_PCT` (60 %). Set any of these in `.env`.
 
+* **Writer signals** (`writer_signals.py`, market hours, with every risk check — every 3 min in the background, 30 s on the Writer risk page). Each fires once a day per position / strike / state. RED and AMBER are urgent notifications; INFO goes to the quieter "Writer info" channel on the phone. Thresholds are in `.env`:
+  * *When to book profit:* **profit target** at `PROFIT_TAKE_PCT` (50 %) and `PROFIT_TAKE_HIGH_PCT` (70 %) of a book's credit captured.
+  * *When to adjust:* **short leg delta** past `SHORT_DELTA_WARN` (0.30, plan the roll) and `SHORT_DELTA_EXIT` (0.40, act); a **short strike inside the 1σ expected move** to its expiry.
+  * *When to get out:* **expiry-day gamma** (after 1 pm on expiry day, spot within `EXPIRY_GAMMA_PCT` 0.5 % of a short strike); **time-based exit** (`TIME_EXIT_DTE` 2 days or less with a short within `TIME_EXIT_PCT` 1 %).
+  * *Volatility:* India VIX up `VIX_SPIKE_PCT` (8 %) on the day (RED at 2×), or ATM IV up `ATM_IV_SPIKE_PTS` (2 pts) since the open (RED at 2×); **put skew steepening** by `SKEW_RISE_PTS` (2 pts).
+  * *Positioning:* **futures buildup** on the near-month future via Shoonya (long / short buildup, short covering, long unwinding, when price moves `FUT_PRICE_PCT` 0.3 % and OI `FUT_OI_PCT` 2 % on the day; AMBER when it runs against your book's delta); **OI wall shift** (biggest call / put OI strike moves, confirmed on two checks); **PCR extremes** past `PCR_HIGH` 1.5 / `PCR_LOW` 0.6; **max pain** in the last two days to expiry.
+  * *Whether to write at all:* once a day after 9:45, **writing conditions** — IV rank (VIX 1-year percentile), IV vs 20-day realised volatility and the chain's verdict.
+  * *Discipline:* `LOSING_STREAK_DAYS` (3) losing days in a row; more than `MAX_ORDERS_PER_DAY` (12) executed orders today.
+
 ### Where Shoonya is used
 Shoonya is used **in market hours only** (weekdays 9:00 am – 3:40 pm IST, pre-open included). Today's saved session connects by itself when the window opens; after 3:40 pm the closing candles and chains are stored and the connection is closed. Outside the window, and whenever Shoonya stops streaming (no index tick for 30 s), every screen uses NSE / Yahoo and the data stored in MongoDB. You can still connect by hand after hours (for example to pull positions); the app asks first.
 
@@ -180,7 +189,8 @@ Everything is stored in MongoDB as it arrives, so the screens keep working witho
 | `broker_positions` | unique `date` | the day's Shoonya position book (offline copy) |
 | `sync_log` | unique `job` | last run, outcome and latest FII/DII dates per sync job |
 | `global_quotes` | unique `(key, session)` | latest quote of each world market per session (offline copy) |
-| `market_alerts` | unique `id` | every GLOBAL / LEVEL alert raised (an id alerts once) |
+| `market_alerts` | unique `id` | every GLOBAL / LEVEL / WRITER alert raised (an id alerts once) |
+| `writer_state` | unique `(day, und)` | the morning baselines for writer signals (ATM IV, skew, OI walls) |
 | `direction_calls` | unique `(und, slot)` | each 15-minute call: direction, score, signals, idea, spot, and the grade at the next call |
 
 Every write is an `UpdateOne(..., upsert=True)` keyed on the natural key, so running a sync again never duplicates data. FII cash and participant-OI records for the same date are merged with `$set`.
